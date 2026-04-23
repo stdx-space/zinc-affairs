@@ -7,7 +7,7 @@ labels: platform, security, interop, ux
 
 # [RFD] Proctored Exam Client Orchestration
 
-This RFD adds the orchestration layer around the `proctoring` extension introduced in [RFD 0011](../0011/README.md): device binding with a platform-authenticator passkey, webcam-based identity verification gated on invigilator approval, and a single bidirectional WebSocket between the exam client and the extension for audited control messages (admission, announcements, private clarifications, force-submit). Media transport, room lifecycle, and LiveKit token issuance are unchanged and continue to be owned by RFD 0011.
+This RFD adds the orchestration layer around the `proctoring` extension introduced in [RFD 0011](../0011/README.md): device binding with a platform-authenticator passkey, webcam-based identity verification reviewed asynchronously by invigilators during the exam, and a single bidirectional WebSocket between the exam client and the extension for audited control messages (announcements, private clarifications, force-submit). Media transport, room lifecycle, and LiveKit token issuance are unchanged and continue to be owned by RFD 0011.
 
 The scope is the coordination between the proctoring extension, the student's exam client, and the `examination` extension ([RFD 0009](../0009/README.md)) during the window from sign-in to exam stop. Automatic room lifecycle tied to `submission_collection.start_at`/`stop_at` (per [RFD 0010](../0010/README.md)) remains deferred — room creation and destruction are still staff-triggered as in RFD 0011.
 
@@ -25,11 +25,11 @@ This RFD covers all three without disturbing RFD 0011's media plane. The motivat
 
 ### In scope
 
-- Device binding via platform-authenticator **passkey** (WebAuthn), created at identity check and used to re-establish sessions after disconnection.
-- **Session bearer** issued after admission and rotated over the control WebSocket.
-- **Webcam identity verification** with invigilator visual confirmation — no ML face matching, no pre-enrolled portrait.
-- **Persisted admission state** on `(user, exam)` so that passkey re-login resumes the exam without re-running identity verification.
-- A **single bidirectional WebSocket** on the proctoring extension carrying admission, announcements, private clarifications, force-submit, and bearer refresh frames; all messages audited by virtue of flowing through the extension.
+- Device binding via platform-authenticator **passkey** (WebAuthn), created on first entry and used to re-establish sessions after disconnection.
+- **Session bearer** issued on entry and rotated over the control WebSocket.
+- **Webcam identity verification** with invigilator visual confirmation — no ML face matching, no pre-enrolled portrait. Verification is **asynchronous**: the student is admitted to the exam on passkey registration, captures are uploaded during the exam, and the invigilator reviews them at any point in the exam window.
+- A **single bidirectional WebSocket** on the proctoring extension carrying announcements, private clarifications, force-submit (also used for rejection-on-verification), and bearer refresh frames; all messages audited by virtue of flowing through the extension.
+- **Object-storage design and cleanup policy** for captured ID photos and face snapshots.
 - Coordination contract with the `examination` extension for the force-submit command.
 
 ### Deferred
@@ -42,7 +42,7 @@ This RFD covers all three without disturbing RFD 0011's media plane. The motivat
 
 ## Architecture
 
-The `proctoring` extension gains a WebSocket endpoint alongside the HTTP routes introduced in RFD 0011. The student client establishes the WS **before** requesting a LiveKit token and keeps it open for the duration of the exam; the invigilator client establishes its own WS with an invigilator-scoped session. All orchestration traffic flows through the extension:
+The `proctoring` extension gains a WebSocket endpoint alongside the HTTP routes introduced in RFD 0011. The student client establishes the WS on entry and keeps it open for the duration of the exam; the invigilator client establishes its own WS with an invigilator-scoped session. All orchestration traffic flows through the extension:
 
 ```
 ui-v2 student app ─────── HTTPS ────── proctoring extension ─── NATS ─── core
@@ -62,13 +62,14 @@ ui-v2 staff app ──────── HTTPS ────── proctoring ext
 
 No changes to `core`. The proctoring extension is already a `ClientModule` per RFD 0011; this RFD adds:
 
-- `POST /v1/proctoring/sessions/register` — passkey registration during identity check.
-- `POST /v1/proctoring/sessions/verify` — submit ID photo + face snapshot for invigilator review.
-- `POST /v1/proctoring/sessions/authenticate` — passkey assertion to re-establish a session.
+- `GET /v1/proctoring/sessions/challenges` — issue a single-use, short-lived (≤ 60 s) WebAuthn challenge bound to `(user_id, activity_id)`. Unauthenticated beyond the normal session cookie; called both before `/register` and before `/authenticate`. Challenges are persisted server-side for one-time consumption; reuse returns `410 Gone`.
+- `POST /v1/proctoring/sessions/register` — consume a registration challenge; passkey registration on entry; issues the first session bearer.
+- `POST /v1/proctoring/sessions/captures` — upload ID photo and face snapshot; streamed to object storage.
+- `POST /v1/proctoring/sessions/authenticate` — consume an assertion challenge; verifies the WebAuthn assertion's `clientDataJSON.challenge` matches the issued value; on success, issues a fresh session bearer.
 - `WSS /v1/proctoring/sessions/stream` — the bidirectional control channel.
-- `GET /v1/proctoring/sessions/:id/captures/:kind` — signed-URL access to ID photo / face snapshot for invigilators (not exposed to students).
+- `GET /v1/proctoring/sessions/:user_id/captures/:kind` — signed-URL access to a specific capture for invigilators with `can_proctor` (not exposed to students).
 
-LiveKit room and token routes from RFD 0011 are unchanged; token issuance gains one precondition (the caller must hold an `admitted` admission state).
+LiveKit room and token routes from RFD 0011 are unchanged. Because identity verification is asynchronous and no longer blocks entry, token issuance needs no new precondition beyond what RFD 0011 already enforces.
 
 ## Device Binding (R1)
 
@@ -82,7 +83,10 @@ await navigator.credentials.create({
     rp: { id: 'exam.zinc.example.com', name: 'ZINC Exam' },
     user: { id: userIdBytes, name, displayName },
     challenge: serverChallenge,
-    pubKeyCredParams: [{ type: 'public-key', alg: -7 }], // ES256
+    pubKeyCredParams: [
+      { type: 'public-key', alg: -7   }, // ES256
+      { type: 'public-key', alg: -257 }, // RS256 — Windows Hello fallback
+    ],
     authenticatorSelection: {
       authenticatorAttachment: 'platform',
       residentKey: 'required',
@@ -95,17 +99,19 @@ await navigator.credentials.create({
 
 The resulting credential is discoverable (passkey), bound to the user's OS account on the exam machine, protected by Windows Hello / Touch ID / Android biometric / ChromeOS equivalent, and hardware-backed on devices with a Secure Enclave / TPM / StrongBox.
 
-Registration happens **during** identity verification, not before: the student proves they can create a passkey on this machine *as part of* demonstrating that they are sitting at their assigned exam station. The resulting credential id is stored by the extension as the `(user, exam)` device binding. Subsequent assertions against the same `(user, exam)` must present this credential id — any other binding requires invigilator intervention.
+Registration happens **on entry** — it is the one action that gates the student's transition from signed-in to in-exam. The resulting credential id is stored by the extension as the `(user, exam)` device binding. Subsequent assertions against the same `(user, exam)` must present this credential id — any other binding requires invigilator intervention. Identity verification (ID photo + face snapshot) follows registration but does not gate admission; it is captured during the exam and reviewed asynchronously (see R2).
 
 ### Lab-environment prerequisite (hard blocker)
 
 Platform-authenticator passkeys require a functioning platform authenticator on the exam machine. Machines without one **cannot be used to take the exam**. There is no software fallback in the shipped product.
 
-Pre-exam onboarding performs a capability probe (`PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`) and hard-fails before the student reaches the identity-check step if no platform authenticator is available. Lab-ops is responsible for guaranteeing coverage across the fleet; a survey of platform-authenticator availability across the target labs is a prerequisite before this RFD moves to `published`.
+Pre-exam onboarding performs a capability probe (`PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`) and hard-fails before the student reaches passkey registration if no platform authenticator is available. Lab-ops is responsible for guaranteeing coverage across the fleet; a survey of platform-authenticator availability across the target labs is a prerequisite before this RFD moves to `published`.
 
 ### Session bearer and rotation
 
-The passkey is **not** used to sign per-request or per-frame traffic. After admission, the extension issues a session bearer (JWT, ≤ 10 min TTL, signed by the extension) tied to the `(user, exam, credential_id)` triple. The bearer rotates over the WebSocket on a schedule well inside its TTL; the client presents the current bearer as the WS bearer token and on any extension HTTP call. Passkey assertions are only invoked for session re-establishment (see below), so user-verification prompts are rare by construction.
+The passkey is **not** used to sign per-request or per-frame traffic. After passkey registration, the extension issues a session bearer (JWT, ≤ 10 min TTL, signed by the extension) tied to the `(user, exam, credential_id)` triple. The bearer rotates over the WebSocket on a schedule well inside its TTL; the client presents the current bearer as the WS bearer token and on any extension HTTP call. Passkey assertions are only invoked for session re-establishment (see below), so user-verification prompts are rare by construction.
+
+**Bearer validation invariant**: JWT signature + expiry are necessary but not sufficient. On every bearer-authenticated request (WS frame, HTTP call, LiveKit token issuance gate), the extension additionally checks that the session row for `(user_id, activity_id)` has `locked_at is null`. A locked session rejects the request with `401` regardless of bearer freshness. This closes the up-to-10-minute window where a force-submitted student's existing bearer would otherwise remain valid.
 
 ### Re-login after disconnect
 
@@ -113,9 +119,9 @@ Session loss events — browser close, tab crash, machine reboot, network flap l
 
 1. The client reaches `/v1/proctoring/sessions/authenticate` with a passkey assertion challenge.
 2. The extension validates the assertion against the stored `credential_id`.
-3. On success, a fresh bearer is issued and the student resumes the exam in the same admission state.
+3. On success, a fresh bearer is issued and the student resumes the exam.
 
-This requires admission to be a **persisted state on `(user, exam)`**, not a per-session event. Once an invigilator admits a student, the admission sticks across reconnects; only an explicit invigilator action (see R4's force re-verify command) invalidates it.
+The device binding itself is the persistent state — because admission is not gated on invigilator approval, re-login requires no admission-state lookup. The only way the student loses access mid-exam is an invigilator-issued `force_submit` (whether as disqualification-on-verification or for any other reason).
 
 ### Cross-device sync
 
@@ -123,39 +129,71 @@ iCloud Keychain and Google Password Manager sync passkeys across a user's device
 
 ## Identity Verification (R2)
 
+Identity verification is **asynchronous** and does not gate exam entry. The student is admitted to the exam on passkey registration; captures are uploaded during the exam and reviewed by invigilators at any point within the exam window. An invigilator who finds a failed verification disqualifies the student by issuing a `force_submit` with a disqualification reason (R4), terminating the student's exam in place. This trade — admit-first, verify-async — is acceptable because a failed verification leads to disqualification regardless of timing, so there is no authorization decision to pre-compute, only an evidence-gathering and audit obligation.
+
 ### Capture flow
 
-The student client walks through two sequential captures after device registration and before admission:
+On entry — after passkey registration, before joining the LiveKit room — the client prompts the student to complete two captures:
 
-1. **ID photo.** The client prompts the student to hold their physical student / national ID up to the webcam. The camera preview is live; the student clicks *Capture* to freeze a still frame. Minimum resolution 1280×720; downsized and JPEG-encoded at ~85% quality client-side to bound payload size.
-2. **Face snapshot.** Same preview, no ID this time. A separate still frame of the student's face.
+1. **ID photo.** The client prompts the student to hold their physical student / national ID up to the webcam. Live preview, student clicks *Capture* to freeze a still frame. Client-side downsized and JPEG-encoded at ~85% quality; target payload ~150 KB.
+2. **Face snapshot.** Same preview, no ID. A separate still frame of the student's face.
 
-Both images are POSTed to `/v1/proctoring/sessions/verify`. The extension persists them to the object store under keys derived from the session id, records pointers in its session state, and pushes a `verification_pending` event over the WS to the invigilator session(s) on the same room.
+Both images are POSTed to `POST /v1/proctoring/sessions/captures`. The extension streams each upload straight to the object store, records pointers in its session state (`(user, activity) → (id_photo_key, face_key, uploaded_at)`), and emits a `capture_uploaded` frame to invigilator sessions for the room so their review queue refreshes.
+
+The student can proceed to join the LiveKit room immediately after capture upload completes — verification review is not a precondition. Upload failure is surfaced to the student as a retryable error; persistent failure escalates to the invigilator queue as "uploads missing" (see below).
+
+### Capture deadline
+
+The client auto-prompts for captures on entry. If a student has not uploaded both captures within **15 minutes of entering the exam**, the extension flags the student in the invigilator review queue as `captures_missing` and emits a reminder frame over the student's WS. The invigilator can then nudge the student (private message) or force-submit with a "verification-not-completed" reason. This exists specifically so that "just never upload" is not a workable strategy.
 
 ### Invigilator review
 
-The invigilator surface renders the two captures side-by-side with the student's name and enrolled id visible. The invigilator chooses *Admit* or *Reject*:
+Invigilators see a review queue alongside the per-student spot-check surface from RFD 0011. Each queue entry renders the student's name and enrolled id, the two captures side-by-side, and the live LiveKit camera thumbnail (if the invigilator has subscribed to it). The invigilator's outcomes:
 
-- **Admit** writes the persisted admission state for `(user, exam)`, makes the student eligible to request a LiveKit token, and pushes an `admitted` event to the student's WS.
-- **Reject** pushes `rejected` with an invigilator-authored reason to the student's WS; the student session ends. Re-attempt requires an explicit invigilator unlock action (out of scope for this RFD to define the exact UX; defer to drafting).
+- **Mark verified.** Records the decision in the audit log and clears the student from the queue. No effect on the student's exam state — they were already in the exam.
+- **Disqualify.** Issues a `force_submit` with reason `identity_verification_failed` (plus optional free-text note). Audited as usual; the examination extension locks the student's exam (see R4).
+- **Request re-capture.** Issues a `reverify_required` frame: the student's client surfaces the capture flow again, overwriting the previous captures. Used when a capture is obscured, wrong ID, etc. The original captures are retained in object storage for audit (never mutated) under a `superseded/` prefix.
+- **Defer.** Leaves the queue entry open. Intended as a "come back to this" — the entry remains visible until exam stop.
 
-There is no ML face matching. The invigilator's judgement is the decision; the photos are evidence, not a verdict.
+There is no ML face matching. The invigilator's judgement is the decision; the photos and live camera are evidence.
 
-### PII storage and retention
+### Object storage
 
-Both captured images are personal data under any plausible regulatory regime and must be handled as such:
+Captured images are stored in a dedicated object-store bucket, separate from academic artefacts:
 
-- **Storage**: object store bucket separate from academic artefacts, encrypted at rest, access controlled by signed URLs issued only to callers holding `can_proctor on proctoring_room:<name>` (or an appeals-office role, if introduced).
-- **Retention**: default window of **90 days post-exam**, chosen to cover the institutional appeal period. After expiry, images are deleted automatically by a scheduled sweep; deletion is non-recoverable. An exam-specific retention override is permitted (e.g. an active academic-misconduct investigation) and is itself audited.
-- **Access logging**: every signed-URL issuance is written to the extension's audit stream with caller identity, subject, and purpose tag.
-- **No export surface**: there is no bulk-export endpoint and no admin-console "view all" path. Individual images are viewable only in the context of a specific session review.
-- **Deletion on student request**: not supported during the retention window — retention is bounded by exam administration policy, not student preference. Documented as a trade-off.
+- **Bucket**: `proctoring-captures` (or equivalent per deployment). Encrypted at rest with deployment-managed keys; server-side encryption header required on every `PutObject`. Public access blocked at the bucket-policy level.
+- **Key layout**:
+  ```
+  {activity_id}/{user_id}/{capture_kind}-{capture_id}.jpg
+  {activity_id}/{user_id}/superseded/{capture_kind}-{capture_id}.jpg   (after re-capture)
+  {activity_id}/{user_id}/held/{capture_kind}-{capture_id}.jpg          (hold-for-dispute)
+  ```
+  `capture_kind` is `id` or `face`. `capture_id` is a server-assigned ULID that ties the object to the session-state pointer.
+- **Upload path**: client → extension → object store, not direct client → object store. The extension acts as a broker so that (a) caller identity is authoritative via the session bearer, not bucket IAM, (b) size and content-type validation happens before the object lands, and (c) a single audit entry covers the upload. Payloads are small enough (~150 KB × 2) that the extra hop is immaterial.
+- **Read path**: signed URLs issued by the extension to callers holding `can_proctor on proctoring_room:<name>` for the room containing this user. URLs are short-lived (≤ 5 minutes), scoped to a single object, and bound to the invigilator's identity in the audit record. No direct bucket access is granted to end users. To minimise PII leakage through incidental caches and logs, the object response must carry `Cache-Control: no-store` and `Pragma: no-cache`; the invigilator page must set a Content-Security-Policy restricting `img-src` to the object-store origin (no third-party leakage); the invigilator client should render captures via short-lived blob URLs rather than leaving the signed URL in the DOM where browser history / extensions can observe it.
+- **No export surface**: no bulk download, no admin-console "view all" path. Images are viewable only in the context of a specific student's review entry.
 
-The extension must not log image bytes or signed URLs to any standard log sink.
+### Cleanup strategy
 
-### Waiting room
+Two-tier retention, implemented primarily by **object-store lifecycle rules** rather than an extension-managed sweep job. This keeps the extension stateless with respect to long-term PII retention and delegates the deletion guarantee to the storage layer:
 
-Between completing captures and receiving an invigilator decision, the student sits in a **waiting state**: the client renders a "verification in progress" view, holds the WS open, and ignores any attempt to request a LiveKit token. This state is explicitly represented in the session state machine so that WS reconnects during the wait resume correctly.
+| Prefix                            | Lifecycle rule                          | Rationale                                                                       |
+|-----------------------------------|-----------------------------------------|---------------------------------------------------------------------------------|
+| `{activity_id}/{user_id}/*.jpg`   | Delete **30 days** after object creation | Active-review + short post-exam appeal window                                   |
+| `{activity_id}/{user_id}/superseded/*.jpg` | Delete **30 days** after creation        | Same as above — retained for audit of the re-capture decision                   |
+| `{activity_id}/{user_id}/held/*.jpg`       | **No lifecycle rule**                   | Explicit hold for ongoing misconduct investigations; deleted by manual process  |
+
+A "hold" action operates at the **`(activity_id, user_id)` prefix level**, not per-object: on hold, the extension enumerates all captures under the user's prefix — including current, `superseded/`, and any other descendants — and moves each into `held/`. This ensures that evidence of a re-captured-and-replaced first submission (the common misconduct shape) is preserved, not silently deleted by the default lifecycle rule. Holds expire on explicit release (which moves objects back to their prior prefix, re-applying lifecycle) — there is no automatic expiry on holds, because investigations run on their own timelines. Each hold and release is audited with reason and owning case id.
+
+**Why 30 days, not 90**: the original 90-day window was sized for institutional appeals. With async verification, the appeal window isn't blocked on review completion — reviews are finished during the exam itself, and post-exam disputes are against the *decision*, not the captures. 30 days is sufficient to cover the common review-and-dispute cycle; longer investigations use the explicit hold.
+
+**Why object-store lifecycle, not an extension sweep**: lifecycle rules are declarative, provider-enforced, and survive extension outages. An extension-managed sweep would duplicate the guarantee less reliably. The extension's role is limited to (a) uploading under the right prefix, (b) moving to `held/` on hold-action, (c) moving back to the default prefix on release — all synchronous, no background jobs. Deletion is entirely the object store's responsibility.
+
+**Access logging**: every signed-URL issuance and every hold/release action is written to the extension's audit stream with caller identity, subject, and reason.
+
+**Logging discipline**: the extension must never log image bytes, signed URLs, or bucket keys to any standard log sink. The audit stream is the only record.
+
+**Deletion on student request** during the retention window is not supported — retention is bounded by exam administration policy, not student preference. Documented as a trade-off.
 
 ## Control Channel (R4)
 
@@ -171,25 +209,28 @@ Every frame is a JSON object with a `type` discriminator and a `seq` for orderin
 
 Frames in scope for this RFD:
 
-| Direction           | Type                        | Purpose                                                                      |
-|---------------------|-----------------------------|------------------------------------------------------------------------------|
-| extension → client  | `bearer_refresh`            | Push a new session bearer before the current one expires                     |
-| extension → student | `admitted` / `rejected`     | Result of invigilator review (post-R2)                                       |
-| extension → student | `announcement`              | Text broadcast from invigilator; `scope: room`, `room_id`                    |
-| extension → student | `private_message`           | Invigilator reply to this student's raise-hand                               |
-| extension → student | `force_submit`              | Instruct the exam client to submit and lock                                  |
-| extension → student | `reverify_required`         | Invalidate admission; client returns to ID-capture flow (see R4 extension)   |
-| student → extension | `raise_hand`                | Student requests clarification; body carries a short text                    |
-| student → extension | `ack`                       | Acknowledge a server frame by `server_seq` (delivery confirmation)           |
-| extension → invig.  | `session_state`             | Per-student admission / presence / raise-hand state for the invigilator grid |
-| extension → invig.  | `verification_pending`      | A new `(student, captures)` is ready for review                              |
-| invig. → extension  | `admit` / `reject`          | Decide on a pending verification                                             |
-| invig. → extension  | `announce`                  | Compose-and-send an announcement to a room                                   |
-| invig. → extension  | `private_reply`             | Reply to a specific student's raise-hand                                     |
-| invig. → extension  | `force_submit`              | Trigger force-submit for a specific student                                  |
-| invig. → extension  | `force_reverify`            | Invalidate a student's admission and send them back through R2               |
+| Direction           | Type                   | Purpose                                                                      |
+|---------------------|------------------------|------------------------------------------------------------------------------|
+| extension → client  | `bearer_refresh`       | Push a new session bearer before the current one expires                     |
+| extension → student | `announcement`         | Text broadcast from invigilator; `scope: room`, `room_id`                    |
+| extension → student | `private_message`      | Invigilator reply to this student's raise-hand                               |
+| extension → student | `force_submit`         | Instruct the exam client to submit and lock (carries a `reason`)             |
+| extension → student | `reverify_required`    | Request a fresh ID + face capture; client re-opens the capture flow          |
+| extension → student | `capture_reminder`     | Nudge a student who hasn't uploaded captures within the deadline window      |
+| student → extension | `raise_hand`           | Student requests clarification; body carries a short text                    |
+| student → extension | `ack`                  | Acknowledge a server frame by `server_seq` (delivery confirmation)           |
+| extension → invig.  | `session_state`        | Per-student presence / capture-status / raise-hand state for the review queue|
+| extension → invig.  | `session_snapshot`     | Reconciliation frame on invigilator reconnect: last-applied `decision_id` per student |
+| extension → invig.  | `capture_uploaded`     | A new capture pair is available for review                                   |
+| invig. → extension  | `mark_verified`        | Record a successful verification (no client-visible effect)                  |
+| invig. → extension  | `announce`             | Compose-and-send an announcement to a room                                   |
+| invig. → extension  | `private_reply`        | Reply to a specific student's raise-hand                                     |
+| invig. → extension  | `force_submit`         | Trigger force-submit for a specific student (with `reason`, incl. `identity_verification_failed`) |
+| invig. → extension  | `force_reverify`       | Request a fresh capture from the student                                     |
+| invig. → extension  | `capture_hold`         | Move a specific capture to the `held/` prefix for ongoing investigation      |
+| invig. → extension  | `capture_hold_release` | Release a hold and restore normal lifecycle retention                        |
 
-A fifth invigilator command — `force_reverify` — is included to cover the edge case where an invigilator admitted a student in error or has cause to repeat the check mid-exam. It invalidates the persisted admission state for `(user, exam)` and the client surfaces the ID-capture flow again; the student retains their passkey binding and does not re-register the device.
+Disqualification is not its own frame type — it is a `force_submit` with `reason: identity_verification_failed`. This keeps lock-and-terminate semantics in one place and reuses the audit + coordination path with the examination extension. `force_reverify` is retained for the "capture is unclear, please redo" case where the invigilator wants a cleaner capture rather than a disqualification.
 
 ### Auditing
 
@@ -210,34 +251,34 @@ Force-submit preserves the student's currently saved answers — it is submit-an
 
 ## Authorization Model
 
-RFD 0011 introduced `proctoring_room` with `parent: activity`, `student: user`, and `can_proctor = can_edit from parent`. This RFD adds a per-`(user, exam)` admission state that is not an OpenFGA relation but extension-local state, keyed on `(user_id, activity_id)` with values:
+RFD 0011 introduced `proctoring_room` with `parent: activity`, `student: user`, and `can_proctor = can_edit from parent`. This RFD does not add any new OpenFGA relation. Because identity verification is asynchronous, there is no pre-entry admission gate to model as a state machine — the only per-`(user, exam)` record needed is the device binding itself (a `credential_id` for the registered passkey) and a per-capture verification status used to drive the invigilator review queue.
 
-- `unverified` (initial — captures not yet reviewed)
-- `pending` (captures submitted, awaiting invigilator)
-- `admitted` (invigilator accepted; LiveKit token issuance unlocked)
-- `rejected` (invigilator rejected; session terminal unless invigilator unlocks)
+The extension maintains a small session table alongside the RFD 0011 cache sidecar, keyed on `(user_id, activity_id)`:
 
-Admission state lives in the extension's database (alongside the RFD 0011 cache sidecar) rather than in OpenFGA because it is a bounded, session-scoped state machine, not a durable access-control relation. The authoritative membership relation remains the RFD 0011 `student` tuple; `admitted` is an additional gate on top, not a replacement.
+- `credential_id` — the passkey credential id registered on entry. Its presence is the device binding.
+- `captures` — per-kind pointers into the object store (`id`, `face`), each with an `uploaded_at` and a verification outcome (`unreviewed` / `verified` / `superseded` / `held`).
+- `locked_at` — set if the student was force-submitted, with the reason. Terminal.
 
-Token issuance (`POST /v1/proctoring/rooms/:name/tokens`) gains a new precondition: an `admitted` state on the caller's `(user_id, activity_id)`. Callers in `pending` receive `202 Accepted` with a hint to wait; callers in `unverified` or `rejected` receive `403`.
+Token issuance (`POST /v1/proctoring/rooms/:name/tokens`) retains RFD 0011's checks unchanged. It gains no new precondition.
 
-Existing authorization checks are unchanged. `can_proctor` continues to inherit from `can_edit` on the parent activity. Invigilator WS actions are authorized per-call against `can_proctor` on the target room.
+Existing authorization checks are unchanged. `can_proctor` continues to inherit from `can_edit` on the parent activity. Invigilator WS actions are authorized per-call against `can_proctor` on the target room. Signed-URL issuance for capture reads additionally requires `can_proctor` on the room containing the capture's subject user.
 
 ## End-to-End Lifecycle
 
 1. **Sign-in.** Student signs in to `ui-v2` as usual. Client navigates to `/activities/:id/proctored`.
 2. **Capability probe.** Client calls `PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`. No → hard fail screen, exam not takeable on this machine. Yes → proceed.
-3. **Establish session.** Client opens `WSS /v1/proctoring/sessions/stream` with the user's normal session cookie; extension creates a session with state `unverified`.
-4. **Device registration.** Client obtains a WebAuthn challenge, creates a platform-authenticator passkey with biometric prompt, POSTs the attestation to `/v1/proctoring/sessions/register`. Extension stores `(user, activity) → credential_id`.
-5. **Identity captures.** Client captures ID photo, then face snapshot, POSTs both to `/v1/proctoring/sessions/verify`. Session state → `pending`. Invigilator's WS receives `verification_pending`.
-6. **Invigilator review.** Invigilator opens the side-by-side review surface, clicks *Admit*. Extension writes admission state, emits `admitted` to the student's WS. Session state → `admitted`.
-7. **LiveKit join.** Client requests a LiveKit token via RFD 0011's `POST /v1/proctoring/rooms/:name/tokens`; the new admission precondition passes. Client connects to the room with VP8 + simulcast + Dynacast as RFD 0011 specifies and publishes camera / microphone / screen.
-8. **In-exam control.** Invigilator broadcasts announcements, handles raise-hands, and spot-checks media per RFD 0011. All non-media interaction flows over the WS.
+3. **Establish session.** Client opens `WSS /v1/proctoring/sessions/stream` with the user's normal session cookie; extension creates a session record.
+4. **Device registration.** Client obtains a WebAuthn challenge, creates a platform-authenticator passkey with biometric prompt, POSTs the attestation to `/v1/proctoring/sessions/register`. Extension stores `(user, activity) → credential_id` and issues the first session bearer. The student is now in the exam.
+5. **Identity captures.** Client auto-prompts for ID photo and face snapshot. Student completes both; client POSTs to `/v1/proctoring/sessions/captures`. Extension streams each to object storage and emits `capture_uploaded` to invigilator sessions. The student can proceed without waiting for review.
+6. **LiveKit join.** Client requests a LiveKit token via RFD 0011's `POST /v1/proctoring/rooms/:name/tokens`. Client connects to the room with VP8 + simulcast + Dynacast as RFD 0011 specifies and publishes camera / microphone / screen.
+7. **In-exam control.** Invigilator broadcasts announcements, handles raise-hands, and spot-checks media per RFD 0011. All non-media interaction flows over the WS.
+8. **Async verification review.** At any point during the exam, invigilators work through the review queue. Outcomes: `mark_verified` (queue clears, no student-visible effect), `force_reverify` (student re-captures), `force_submit` with `reason: identity_verification_failed` (student disqualified), or deferred.
 9. **Bearer rotation.** Extension pushes `bearer_refresh` every ~8 min; client replaces its bearer. No user interaction.
-10. **Browser crash.** Student reopens `/activities/:id/proctored`. Client probe succeeds, WS reconnects, extension sees no live session for this `(user, activity)` and prompts passkey assertion. Client calls `/v1/proctoring/sessions/authenticate` with an assertion; extension validates, issues a new bearer, restores the admitted state, and the student resumes. No invigilator involvement.
-11. **Raise hand.** Student sends `raise_hand`. Invigilator WS receives it, invigilator authors a `private_reply`. Both audited.
-12. **Force submit.** Invigilator sends `force_submit` for a specific student. Extension audits, publishes `proctoring.force_submit` on NATS, examination extension processes, student's exam client locks.
-13. **Exam stop.** Staff clicks *Stop proctoring* per RFD 0011. Extension closes all WS sessions for the exam with a `session_ended` frame, deletes admission state, and runs RFD 0011's room-deletion path. Captured images remain in the object store for the retention window.
+10. **Browser crash.** Student reopens `/activities/:id/proctored`. Client probe succeeds, WS reconnects, extension prompts passkey assertion. Client calls `/v1/proctoring/sessions/authenticate` with an assertion; extension validates against the stored credential id, issues a new bearer, and the student resumes. Uploaded captures and verification state persist across the reconnect. No invigilator involvement.
+11. **Capture deadline miss.** If 15 minutes pass since entry without both captures uploaded, the extension flags the student as `captures_missing` in the invigilator queue and emits a `capture_reminder` to the student.
+12. **Raise hand.** Student sends `raise_hand`. Invigilator WS receives it, invigilator authors a `private_reply`. Both audited.
+13. **Force submit.** Invigilator sends `force_submit` for a specific student. Extension audits, publishes `proctoring.force_submit` on NATS, examination extension processes, student's exam client locks.
+14. **Exam stop.** Staff clicks *Stop proctoring* per RFD 0011. Extension closes all WS sessions for the exam with a `session_ended` frame, marks any unreviewed captures accordingly in the audit log, and runs RFD 0011's room-deletion path. Captured images remain in the object store under the 30-day lifecycle rule (or indefinitely if under a `held/` hold).
 
 ## Alternatives Considered
 
@@ -262,21 +303,30 @@ A hybrid where control frames travel over the LiveKit data channel for low-laten
 ## Implementation Notes
 
 - **Bearer TTL and rotation cadence.** Proposed: 10 min TTL, rotated every 8 min. The rotation cadence must be strictly inside the TTL to leave slack for in-flight retries. These values are starting points — tune after load testing per RFD 0011's pre-`published` load test.
-- **WS reconnect during verification window.** If the WS drops while the session is in `pending`, the client re-opens the WS and the extension replays the most recent `verification_pending` → `admitted`/`rejected` events up to the last acknowledged `server_seq`. Captures already uploaded are not re-uploaded; the client recognises its state by the server's hello frame.
-- **Idempotency on admission.** Invigilator `admit` frames carry a client-generated `decision_id`; the extension dedupes on this id so that a double-click during a slow round-trip does not produce two audit entries.
+- **Session table durability.** The `(user_id, activity_id)` session table (`credential_id`, `captures`, `locked_at`) lives in the proctoring extension's durable store (Postgres, co-located with the RFD 0011 cache sidecar). In-memory-only storage is not acceptable: a locked student must remain locked across extension restarts, and the session restore on reconnect depends on the stored `credential_id`.
+- **WS frame replay on reconnect.** Clients track the highest `server_seq` they have acked. On reconnect, the client sends its last-acked `server_seq` in the hello frame; the extension replays every server-originated frame with `server_seq > client_last_ack` before transitioning to normal operation. Applied invigilator decisions are part of the replay. Client-originated frames are not replayed — the client is responsible for re-sending anything without a matching `ack`.
+- **Invigilator decision reconciliation on reconnect.** When an invigilator WS reconnects, the hello response includes a `session_snapshot` frame carrying the most recent `decision_id` applied per student on this invigilator's queue. The invigilator client uses this to determine whether a pending decision made it before disconnect, so it can safely skip or re-send without guessing. `decision_id`s are persisted alongside the audit record for the retention period of the audit stream.
+- **Pre-registration WS timeout.** The WS opened at step 3 (before passkey registration) accepts only challenge-related exchanges and is closed by the extension with a `registration_timeout` reason if registration does not complete within 5 minutes of connect. This prevents dangling unbound sessions from accumulating on abandoned tabs.
+- **Reconnect rate limit.** A client may attempt at most 5 passkey assertions per `(user_id, activity_id)` per 5-minute window. Further attempts are rejected with `429 Too Many Requests` and a `Retry-After` header; the client must apply exponential back-off (base 2, starting at 2 s, cap 60 s) before the next retry. This caps user-visible WebAuthn prompts on unstable Wi-Fi and prevents assertion-storm resource exhaustion on the extension.
+- **Idempotency on invigilator decisions.** Invigilator-authored frames (`mark_verified`, `force_submit`, `force_reverify`, `capture_hold`, `capture_hold_release`) carry a client-generated `decision_id`; the extension dedupes on this id so that a double-click during a slow round-trip does not produce two audit entries.
 - **Force-submit delivery guarantees.** `force_submit` is at-least-once to the examination extension over NATS (the extension retries until `examination.submitted` is observed or a staff-level timeout elapses). The client-side `force_submit` frame is advisory UI — the authoritative lock is done by the examination extension.
-- **Rejection retry policy.** Out of the gate, a rejected student cannot self-retry; only an invigilator unlock action reopens the ID-capture flow. Specific UX (retry-cap, unlock endpoint) to be finalised during drafting of the staff tool.
+- **Re-capture is pointer-first, move-after.** When `force_reverify` is issued and a new capture is uploaded, the commit point is the session-state pointer update: the new capture lands at a fresh key first, then the pointer is advanced in a single transactional write, then the old object is `CopyObject`-ed to `superseded/` and the original deleted. If the extension crashes between the pointer update and the move, the old object simply remains at its original path — it is still covered by the default-prefix 30-day lifecycle rule, and a reconciliation sweep (run on extension start) moves any orphaned objects whose session pointer has advanced past them. No session state can observe a half-moved capture.
+- **Capture upload failure handling.** If the client cannot upload within the 15-minute deadline despite retrying, the client surfaces an error and the session is flagged `captures_missing` to the invigilator. The invigilator has explicit UI to either nudge (private message) or disqualify. No automatic disqualification on upload failure — network problems should not lose a student their exam silently.
 - **Capture size bounds.** Client-side JPEG at 1280×720, ~85% quality, typical ~150 KB; reject uploads > 1 MB at the extension.
-- **Passkey registration does not gate the WS open.** If WebAuthn creation is cancelled by the student, the session stays in `unverified` and the extension surfaces a retry path. Cancelling repeatedly does not consume any resource except the open WS.
+- **Passkey registration is the entry gate.** If WebAuthn creation is cancelled by the student, the session remains without a device binding and the client surfaces a retry prompt. The student cannot proceed to the exam without completing registration. Cancelling repeatedly does not consume any resource except the open WS.
 - **Origin and RP ID.** `rp.id` must match the exam origin exactly; passkeys scoped to `zinc.example.com` cannot be used at `exam.zinc.example.com` and vice versa. Deployment choice pending.
+- **Object-store lifecycle rule verification.** Lifecycle rules are easy to mis-configure at deployment. A post-deploy check must assert both rules are present and correctly scoped; the deployment runbook should include this.
 
 ## Known Limitations and Accepted Trade-offs
 
 - **Platform-authenticator availability is a hard deployment precondition.** Fleets without full coverage cannot use this RFD's R1 mechanism; the fleet survey is a prerequisite to `published`. Alternative A is the standing contingency.
+- **The intranet boundary is the only control preventing cross-device passkey sync abuse.** Synced passkeys (iCloud Keychain, Google Password Manager) on a student's personal device become valid re-login credentials if — through misconfigured VLANs, NAT hairpinning, or maintenance-window routing changes — the exam origin becomes reachable off the lab intranet. The application has no network-layer enforcement of the intranet boundary. Deployment runbooks must treat network isolation as a security control with the same operational rigor as any other control (change review, monitoring, incident response). If this control cannot be guaranteed, the device-binding model collapses and an alternative (per-machine certificate, WebAuthn with `hints: ['client-device']`, etc.) must be introduced.
 - **Invigilator visual match is the only identity signal.** False negatives (a lookalike, a very old ID photo) are not caught by the system and must be caught by physical invigilation. This is the same trade-off any non-biometric exam has historically accepted.
-- **Passkey binds to the OS account, not the machine.** A student who can log into a different OS account on the same lab machine will fail to re-bind automatically. Invigilator intervention (`force_reverify`) is the escape hatch. Lab-ops policies (one OS session per student per exam) are assumed.
+- **Admit-first exposes unreviewed students to exam content briefly.** A student who would have been rejected on sight sees question material between entry and review. In-scope risk because (a) consequences of a failed verification are the same in either model (disqualification), and (b) live camera + physical invigilation already provide a parallel signal. Pre-exam rejection was deemed worse because it would require synchronous review capacity sized to the cohort's entry burst.
+- **Unreviewed-at-exam-stop captures exist.** If invigilators fall behind, some captures will still be `unreviewed` at exam stop. These are retained under the normal 30-day lifecycle and can be reviewed post-hoc; decisions made after exam stop have whatever standing institutional policy allows them. Not the system's problem to close.
+- **Passkey binds to the OS account, not the machine.** A student who can log into a different OS account on the same lab machine will fail to re-bind automatically. Invigilator intervention (`force_reverify` or re-entry) is the escape hatch. Lab-ops policies (one OS session per student per exam) are assumed.
 - **Mid-exam OpenFGA revocation still has the RFD 0011 TTL window.** If a student's `student` tuple is removed during an exam, their existing LiveKit token and extension bearer remain valid until expiry. This RFD does not close the window; the follow-up that introduces `proctoring.*` NATS events (deferred from RFD 0011) will.
-- **PII retention is a policy, not a mechanism.** A 90-day retention window enforced by a scheduled sweep is only as good as the sweep. Monitoring on the sweep job and its completion metrics is part of the deployment runbook, not this RFD.
+- **PII retention is enforced by object-store lifecycle rules.** Correctness of deletion depends on the deployment's lifecycle rules being present and scoped correctly. A post-deploy check validates the rules; drift or mis-config is caught there, not at scale.
 - **Force-submit semantics are defined by the examination extension.** This RFD guarantees delivery and audit but not the answer-handling semantics. If the examination extension is unavailable, force-submit degrades to an audit-only event; the client will not see a lock. Degraded behaviour during an examination-extension outage is documented, not prevented.
 
 ## Glossary
@@ -288,8 +338,10 @@ A hybrid where control frames travel over the LiveKit data channel for low-laten
 | **Platform authenticator** | An authenticator built into the device (Touch ID / Face ID / Windows Hello / Android biometric / ChromeOS). Contrasted with *roaming authenticators* like YubiKeys. |
 | **User verification** | A WebAuthn property meaning the authenticator verified the user's presence *and* identity (e.g. biometric or PIN) at signing time. Stronger than user presence alone. |
 | **Attestation** | A signed statement from an authenticator asserting the provenance of a credential (e.g. "this credential was created in a genuine Apple Secure Enclave"). Optional at registration; not used in this RFD. |
-| **Session bearer** | The short-lived JWT issued by the proctoring extension after admission, rotated over the WS, and used to authenticate extension API calls and WS frames. |
-| **Admission state** | An extension-local state per `(user, exam)` with values `unverified` / `pending` / `admitted` / `rejected`, gating LiveKit token issuance and surviving session reconnects. |
+| **Session bearer** | The short-lived JWT issued by the proctoring extension on entry, rotated over the WS, and used to authenticate extension API calls and WS frames. |
+| **Device binding** | The stored `credential_id` of the passkey registered on entry for a given `(user, exam)`. Re-login requires presenting an assertion against this id. |
+| **Review queue** | The invigilator's surface listing per-student capture status (`unreviewed` / `verified` / `captures_missing` / `superseded` / `held`). Reviewed asynchronously during the exam. |
+| **Capture hold** | An explicit admin action moving a capture to a retention-exempt prefix in the object store, for ongoing investigations beyond the default 30-day window. |
 | **Control WS** | The single bidirectional WebSocket on the proctoring extension carrying non-media orchestration traffic for the full exam lifecycle. |
 
 ## References
