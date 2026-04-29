@@ -67,7 +67,7 @@ No changes to `core`. The proctoring extension is already a `ClientModule` per R
 - `POST /v1/proctoring/sessions/captures` — upload ID photo and face snapshot; streamed to object storage.
 - `POST /v1/proctoring/sessions/authenticate` — consume an assertion challenge; verifies the WebAuthn assertion's `clientDataJSON.challenge` matches the issued value; on success, issues a fresh session bearer.
 - `WSS /v1/proctoring/sessions/stream` — the bidirectional control channel.
-- `GET /v1/proctoring/sessions/:user_id/captures/:kind` — signed-URL access to a specific capture for invigilators with `can_proctor` (not exposed to students).
+- `GET /v1/proctoring/sessions/:user_id/captures/:kind` — extension-streamed plaintext capture for invigilators with `can_proctor`. Decryption happens inside the extension (see R2 Encryption); signed URLs are not used.
 
 LiveKit room and token routes from RFD 0011 are unchanged. Because identity verification is asynchronous and no longer blocks entry, token issuance needs no new precondition beyond what RFD 0011 already enforces.
 
@@ -148,7 +148,7 @@ The client auto-prompts for captures on entry. If a student has not uploaded bot
 
 ### Invigilator review
 
-Invigilators see a review queue alongside the per-student spot-check surface from RFD 0011. Each queue entry renders the student's name and enrolled id, the two captures side-by-side, and the live LiveKit camera thumbnail (if the invigilator has subscribed to it). The invigilator's outcomes:
+Invigilators see a review queue alongside the per-student spot-check surface from RFD 0011. Opening a queue entry auto-subscribes to the student's LiveKit camera publication via `setSubscribed(true) + setVideoQuality(HIGH)`, rendering a three-up layout — **captured ID photo | captured face snapshot | live camera** — so the invigilator's decision is informed by the person currently at the machine, not just the stills. The surface auto-unsubscribes on close to honor RFD 0011's idle-is-signalling-only Dynacast property. If the student's camera is not currently published (not yet joined LiveKit, reconnecting), the live tile shows a placeholder and the invigilator may defer or decide on the stills alone. Outcomes:
 
 - **Mark verified.** Records the decision in the audit log and clears the student from the queue. No effect on the student's exam state — they were already in the exam.
 - **Disqualify.** Issues a `force_submit` with reason `identity_verification_failed` (plus optional free-text note). Audited as usual; the examination extension locks the student's exam (see R4).
@@ -161,7 +161,7 @@ There is no ML face matching. The invigilator's judgement is the decision; the p
 
 Captured images are stored in a dedicated object-store bucket, separate from academic artefacts:
 
-- **Bucket**: `proctoring-captures` (or equivalent per deployment). Encrypted at rest with deployment-managed keys; server-side encryption header required on every `PutObject`. Public access blocked at the bucket-policy level.
+- **Bucket**: `proctoring-captures` (or equivalent per deployment). Public access blocked at the bucket-policy level. Bucket-level encryption (SSE-S3 / SSE-KMS) is permitted as defense in depth but **is not load-bearing** — confidentiality is provided by application-level envelope encryption (see Encryption below). The design must be portable across object stores that do not offer equivalent server-side features.
 - **Key layout**:
   ```
   {activity_id}/{user_id}/{capture_kind}-{capture_id}.jpg
@@ -170,8 +170,49 @@ Captured images are stored in a dedicated object-store bucket, separate from aca
   ```
   `capture_kind` is `id` or `face`. `capture_id` is a server-assigned ULID that ties the object to the session-state pointer.
 - **Upload path**: client → extension → object store, not direct client → object store. The extension acts as a broker so that (a) caller identity is authoritative via the session bearer, not bucket IAM, (b) size and content-type validation happens before the object lands, and (c) a single audit entry covers the upload. Payloads are small enough (~150 KB × 2) that the extra hop is immaterial.
-- **Read path**: signed URLs issued by the extension to callers holding `can_proctor on proctoring_room:<name>` for the room containing this user. URLs are short-lived (≤ 5 minutes), scoped to a single object, and bound to the invigilator's identity in the audit record. No direct bucket access is granted to end users. To minimise PII leakage through incidental caches and logs, the object response must carry `Cache-Control: no-store` and `Pragma: no-cache`; the invigilator page must set a Content-Security-Policy restricting `img-src` to the object-store origin (no third-party leakage); the invigilator client should render captures via short-lived blob URLs rather than leaving the signed URL in the DOM where browser history / extensions can observe it.
+- **Read path**: extension-mediated. The invigilator client hits `GET /v1/proctoring/sessions/:user_id/captures/:kind`; the extension authorizes (`can_proctor`), fetches the wrapped DEK from the session table, unwraps via the KMS interface, fetches the ciphertext object, decrypts in-memory, and streams plaintext with `Cache-Control: no-store` and `Pragma: no-cache`. The invigilator page must set a Content-Security-Policy restricting `img-src` to `'self'` so captures cannot be sourced from third-party origins, and the client should render captures via short-lived blob URLs rather than leaving the response URL in the DOM. No direct bucket access is granted to end users; signed URLs are not used.
 - **No export surface**: no bulk download, no admin-console "view all" path. Images are viewable only in the context of a specific student's review entry.
+
+#### Encryption
+
+Confidentiality of captures is provided at the application layer so that the design is portable across object stores. The extension performs all encryption before upload and all decryption on read; the object store sees only opaque ciphertext.
+
+**Cipher.** XChaCha20-Poly1305 (RFC 8439-extended) for new captures: 256-bit key, 192-bit random nonce, AEAD with AAD support. Random-nonce collision is negligible at any practical volume. AES-256-GCM is supported as a compliance fallback (FIPS-required deployments) and is selected via the format's `cipher_id` byte. Per-object DEKs reduce the AES-GCM nonce-reuse hazard to a single bug surface, but XChaCha20-Poly1305 is preferred where no compliance constraint applies because the larger nonce structurally tolerates implementation drift. AES-256-GCM-SIV (RFC 8452) was considered as an AES variant with native nonce-misuse resistance; rejected because it offers no advantage over XChaCha20-Poly1305 in the primary path, has narrower mature-library coverage than AES-GCM, and is not yet a registered FIPS mode — so it satisfies neither the portability nor the compliance use case.
+
+**Envelope.** Per-object random 256-bit DEK encrypts the JPEG; a long-lived KEK wraps the DEK. The wrapped DEK is stored in the extension's session table (Postgres) alongside the capture pointer; the object body holds only ciphertext + format metadata. This split means an attacker must compromise both Postgres and the object store to decrypt — a deliberate divergence from single-blob envelope formats. The threat-model claim holds only when the two systems have **distinct credential planes** (separate IAM principals, separate Vault AppRoles, etc.); deployments that share credentials between Postgres and the object store collapse the boundary and should not rely on the split for protection.
+
+**On-disk object format** (custom binary; no on-disk JOSE/JWE because there is no interop boundary, and JWE compact serialization would inflate blobs by ~33% from base64url for no benefit in a single-application pipeline):
+
+```
+Field             Bytes  Notes
+----------------  -----  -----------------------------------------------
+format_version     1     Currently 0x01
+cipher_id          1     0x01 = XChaCha20-Poly1305, 0x02 = AES-256-GCM
+kek_version        4     Big-endian uint32; selects KEK on unwrap
+nonce_length       1     24 (XChaCha20) or 12 (AES-GCM)
+nonce              N     Cryptographically random per encryption
+ciphertext + tag   var   AEAD output: ciphertext || 16-byte auth tag
+```
+
+**AAD** (reconstructed from the Postgres row at decrypt time, never stored in the object body):
+
+```
+AAD = activity_id (16) || user_id (16) || capture_kind (1) || capture_id (16) || kek_version (4)
+```
+
+ULIDs are 128-bit fixed-length identifiers, so concatenated raw bytes are unambiguous without separators. Any field tampering — a copied ciphertext under a different student, a downgraded `kek_version` — fails decryption at the auth tag.
+
+**AAD source rule (load-bearing).** Every field in the AAD is sourced **from the `session_captures` Postgres row**, never from the object body header. The header `kek_version` is used only to dispatch to the correct KEK for unwrap and **must be cross-validated** against the row's `kek_version` before decryption begins; a mismatch is treated as tampering and the read fails. Reading the AAD `kek_version` (or any other field) from the header instead of the row would silently defeat the downgrade and swap protections.
+
+**KEK abstraction.** The extension exposes a `KeyManagementService` interface (`WrapDEK` / `UnwrapDEK`). Default implementation: KEK is a 256-bit secret from the deployment's secret manager (Vault static, K8s Secret, env var); wrap/unwrap is in-process AEAD. This keeps the design self-contained — no external KMS is required — which matters for portability and small deployments. Recommended for production: HashiCorp Vault Transit (self-hosted, vendor-neutral, KEK never resident in the extension). AWS KMS, GCP KMS, and Azure Key Vault are also pluggable; none are required.
+
+Interface contract: implementations must be **safe for concurrent callers** (the read path bursts on review-queue refresh) and must distinguish at least three error classes — `unknown_version` (the requested `kek_version` is not loadable, signalling startup misconfiguration or premature retirement), `auth_failure` (decrypt or unwrap failed the AEAD tag check, signalling tampering or corruption), and `transport_failure` (transient — retryable). Conflating them masks security-relevant signals and breaks the rotation safeguards.
+
+**Rotation.** `kek_version` is a monotonic uint32. New uploads use the current version; old versions are retained in the secret manager for unwrap of legacy data. Re-wrapping historical records to the new version touches only Postgres rows, not object bodies — significantly cheaper than re-encrypting captures, but **not operationally free**: it is a long-running batch under an advisory lock to prevent concurrent re-wrap from competing replicas, and progress must survive extension restarts.
+
+A version cannot be retired until `SELECT DISTINCT kek_version FROM session_captures` confirms no row references it; premature retirement is a data-loss event. Retirement therefore follows a strict ordering: (a) confirm zero rows reference the version, (b) remove the version from the secret manager, (c) only then deploy the configuration that prunes it. Skipping the ordering — for example pruning the secret first, then discovering a row still references it — is unrecoverable for that capture.
+
+On startup, the extension verifies every `kek_version` present in the table is loadable from the configured KMS and fails fast if not. This catches misconfigured rolling deploys but only on the new replica; old replicas continue serving until killed, so a bad rotation may appear healthy at the load-balancer level for the duration of the rollout.
 
 ### Cleanup strategy
 
@@ -189,9 +230,9 @@ A "hold" action operates at the **`(activity_id, user_id)` prefix level**, not p
 
 **Why object-store lifecycle, not an extension sweep**: lifecycle rules are declarative, provider-enforced, and survive extension outages. An extension-managed sweep would duplicate the guarantee less reliably. The extension's role is limited to (a) uploading under the right prefix, (b) moving to `held/` on hold-action, (c) moving back to the default prefix on release — all synchronous, no background jobs. Deletion is entirely the object store's responsibility.
 
-**Access logging**: every signed-URL issuance and every hold/release action is written to the extension's audit stream with caller identity, subject, and reason.
+**Access logging**: every capture read (caller, subject, capture kind, `kek_version`, decrypt outcome) and every hold/release action is written to the extension's audit stream.
 
-**Logging discipline**: the extension must never log image bytes, signed URLs, or bucket keys to any standard log sink. The audit stream is the only record.
+**Logging discipline**: the extension must never log image bytes, plaintext DEKs, KEK material, or bucket keys to any standard log sink. The audit stream is the only record.
 
 **Deletion on student request** during the retention window is not supported — retention is bounded by exam administration policy, not student preference. Documented as a trade-off.
 
@@ -315,7 +356,12 @@ A hybrid where control frames travel over the LiveKit data channel for low-laten
 - **Capture size bounds.** Client-side JPEG at 1280×720, ~85% quality, typical ~150 KB; reject uploads > 1 MB at the extension.
 - **Passkey registration is the entry gate.** If WebAuthn creation is cancelled by the student, the session remains without a device binding and the client surfaces a retry prompt. The student cannot proceed to the exam without completing registration. Cancelling repeatedly does not consume any resource except the open WS.
 - **Origin and RP ID.** `rp.id` must match the exam origin exactly; passkeys scoped to `zinc.example.com` cannot be used at `exam.zinc.example.com` and vice versa. Deployment choice pending.
-- **Object-store lifecycle rule verification.** Lifecycle rules are easy to mis-configure at deployment. A post-deploy check must assert both rules are present and correctly scoped; the deployment runbook should include this.
+- **Object-store lifecycle rule verification.** Lifecycle rules are easy to mis-configure at deployment. A post-deploy check must assert both rules are present and correctly scoped; a daily probe asserts no objects older than 31 days exist outside `held/`. Lifecycle rules run asynchronously; the probe is the actual deletion guarantee.
+- **Capture upload Content-Type.** Ciphertext PUTs use `application/octet-stream`. Object-store middlewares that re-encode `image/jpeg` will destroy the trailing AEAD tag and produce silent decryption failures.
+- **CSPRNG validation.** Extension verifies on startup that `crypto/rand` (or platform equivalent) returns entropy without error; CSPRNG failure during a capture upload is fatal and the request fails closed. Containerized environments can hit `getrandom` blocks at start.
+- **In-memory key hygiene.** KEK held in `memguard`-locked memory (Go: `awnumar/memguard`; Python: `bytearray` cleared after use; Node: `Buffer.fill(0)`). DEKs are short-lived and best-effort zeroed in a `defer`. This is defense-in-depth against memory forensics, not a cryptographic guarantee — managed-runtime GC can copy values that the application cannot reach to clear.
+- **Orphaned wrapped-DEK rows.** A reconciliation sweep removes `session_captures` rows whose object-store object no longer exists (post-lifecycle deletion). A 30-day-after-`uploaded_at` TTL on the row matches the default lifecycle rule; rows for `held/` captures are exempt.
+- **Unknown format header values fail closed.** A reader that encounters an unrecognised `format_version` or `cipher_id` byte must reject the read with an explicit error — never attempt partial parsing, never default to a known format. This is a security property (preventing downgrade-to-known) as well as defensive coding.
 
 ## Known Limitations and Accepted Trade-offs
 
@@ -328,6 +374,11 @@ A hybrid where control frames travel over the LiveKit data channel for low-laten
 - **Mid-exam OpenFGA revocation still has the RFD 0011 TTL window.** If a student's `student` tuple is removed during an exam, their existing LiveKit token and extension bearer remain valid until expiry. This RFD does not close the window; the follow-up that introduces `proctoring.*` NATS events (deferred from RFD 0011) will.
 - **PII retention is enforced by object-store lifecycle rules.** Correctness of deletion depends on the deployment's lifecycle rules being present and scoped correctly. A post-deploy check validates the rules; drift or mis-config is caught there, not at scale.
 - **Force-submit semantics are defined by the examination extension.** This RFD guarantees delivery and audit but not the answer-handling semantics. If the examination extension is unavailable, force-submit degrades to an audit-only event; the client will not see a lock. Degraded behaviour during an examination-extension outage is documented, not prevented.
+- **KEK loss is unrecoverable.** Captures encrypted under a lost KEK version cannot be decrypted by anyone. KEK material is treated as a backed-up root credential; loss equals data destruction.
+- **Extension is the single read path for captures, including bursts.** Decryption happens in the extension; each read holds a ~150 KB plaintext JPEG in memory and incurs two I/O round-trips (Postgres for the wrapped DEK, object store for the ciphertext). This is a different shape of load than the WS frames already on the critical path — bursty rather than long-lived. Invigilator review at exam-start or after a `capture_uploaded` storm can spike concurrent decrypts; capacity planning must size for review concurrency, not just connected sessions, and the extension may need a per-session decrypt rate limit if review queues grow large. An extension outage also means invigilators cannot view captures during the outage.
+- **In-process KEK default protects against object-store credential leakage, not extension-process compromise — and the exposure surface is broader than runtime memory.** A KEK held in the extension's memory is exposed by: heap and core dumps written on panic, `/proc/self/mem` access from a same-UID process, container image snapshots that include the running container's memory, and crash reporters that include process memory. The configuration surface is also exposed: env vars are readable by any subprocess `exec`'d as the same UID; K8s Secrets mounted as files are world-readable inside the container; both can leak through CI logs that print rendered manifests. `memguard`-locked memory mitigates passive scraping but does not close synchronous-dump paths. Deployments concerned with these threats should use Vault Transit or a cloud KMS, where the KEK never enters extension memory. The default exists for portability, not as a maximum-strength configuration.
+- **Live webcam unavailable when student has not yet joined LiveKit.** The review surface degrades to stills-only; the invigilator can defer or decide on stills. Common shape during the first minute of a student's session.
+- **Live-webcam track identity not contracted with RFD 0011 across reconnects.** When a student reconnects mid-exam (browser crash, machine reboot), LiveKit issues a new participant identity; an invigilator who opened a review entry before the reconnect remains subscribed to a stale track. RFD 0011 does not currently document a stable `(user_id, activity_id) → participant_identity` mapping that survives reconnects, so the invigilator client must re-resolve the publication on each open and detect track-publication churn between the open and the eventual subscribe. Tightening this contract belongs to a follow-up RFD that updates 0011, not this one.
 
 ## Glossary
 
@@ -343,6 +394,10 @@ A hybrid where control frames travel over the LiveKit data channel for low-laten
 | **Review queue** | The invigilator's surface listing per-student capture status (`unreviewed` / `verified` / `captures_missing` / `superseded` / `held`). Reviewed asynchronously during the exam. |
 | **Capture hold** | An explicit admin action moving a capture to a retention-exempt prefix in the object store, for ongoing investigations beyond the default 30-day window. |
 | **Control WS** | The single bidirectional WebSocket on the proctoring extension carrying non-media orchestration traffic for the full exam lifecycle. |
+| **DEK / KEK** | Data Encryption Key (per-object) and Key Encryption Key (long-lived, wraps DEKs). The two-tier structure of envelope encryption. |
+| **Envelope encryption** | Pattern in which each object is encrypted with its own DEK, and the DEK itself is encrypted (wrapped) by a KEK. Allows independent rotation of the KEK without re-encrypting object bodies. |
+| **AAD** | Additional Authenticated Data — input to an AEAD cipher that is authenticated but not encrypted. Used here to bind ciphertext to its identity (`activity_id, user_id, capture_kind, capture_id, kek_version`). |
+| **XChaCha20-Poly1305** | An AEAD cipher with a 256-bit key and 192-bit nonce (RFC 8439-extended). The large nonce makes random-nonce collisions negligible at any practical scale. |
 
 ## References
 
@@ -352,3 +407,6 @@ A hybrid where control frames travel over the LiveKit data channel for low-laten
 - [W3C Web Authentication Level 3](https://www.w3.org/TR/webauthn-3/)
 - [MDN: Web Authentication API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Authentication_API)
 - [passkeys.dev — platform authenticator support matrix](https://passkeys.dev/device-support/)
+- [RFC 8439 — ChaCha20 and Poly1305 for IETF Protocols](https://www.rfc-editor.org/rfc/rfc8439)
+- [NIST SP 800-38D — AES-GCM specification](https://csrc.nist.gov/pubs/sp/800/38/d/final)
+- [OWASP Cryptographic Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html)
