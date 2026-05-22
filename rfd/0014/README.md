@@ -230,6 +230,30 @@ differentiated per-case marks, those live in their authored fragment
 score expression — see [Locals across coding
 fragments](#locals-across-coding-fragments)).
 
+### Exposure through `document.examination`
+
+Under the relaxed RFD 0013 contract, the marking-scheme blob fields
+flow into the document namespace under `marking.<...>` per question.
+Both pipeline-scope and formula-scope see everything except `marks` —
+that field is formula-only by design (the pipeline doesn't make
+scoring decisions). The mapping from blob field to namespace:
+
+| Modality | `marking.<...>` fields exposed | Pipeline scope | Formula scope |
+|---|---|---|---|
+| `mc`     | `expected_file` (path string materialized by the generator from `correct_choice`) | ✓ | ✓ + `marks` |
+| `tf`     | `expected_file` (path materialized from `answer`) | ✓ | ✓ + `marks` |
+| `sa`     | `expected_file` (from `expected`); `diff_flags` (list of strings translated from `match_options`) | ✓ | ✓ + `marks` |
+| `essay`  | none (not auto-graded) | n/a | only `marks` |
+| `coding` | none (instructor-authored fragment is the rubric) | n/a | only `marks` |
+
+The raw blob fields (`correct_choice`, `answer`, `expected`,
+`match_options`) are translated by the generator into the
+`marking.expected_file` path and `marking.diff_flags` list at
+materialization time, so the pipeline reads ready-to-use values rather
+than re-interpreting marking-scheme semantics. This keeps the pipeline
+HCL agnostic to the marking-scheme schema's exact field names — only
+the generator knows the translation.
+
 ### SA match options
 
 The `match_options` for SA questions is a flat boolean object. Each
@@ -261,22 +285,29 @@ on the next grading run.
 ### Derived assets
 
 For non-coding modalities, the generator materializes the
-expected-answer content into the examination's asset path so the
-assembled pipeline's `diff` calls have files to compare against:
+expected-answer content into a file the assembled pipeline's `diff`
+calls compare against. The file path is **chosen by the generator**
+(or by the runtime — exact layout is a runtime concern) and **exposed
+to the pipeline through `document.examination.questions[<id>].marking.expected_file`**,
+per the RFD 0013 contract relaxation. There is no hardcoded path
+convention authors or runtime code depend on; the marking data the
+pipeline reads is the path the generator wrote, period.
 
-- `examination-assets/mc/<qid>.expected` — contains the
-  `correct_choice` string (e.g., `"B"`).
-- `examination-assets/tf/<qid>.expected` — contains the boolean
-  rendered as the same string the student submits (per modality
-  convention — `"true"` / `"false"`).
-- `examination-assets/sa/<qid>.expected` — contains the `expected`
-  string verbatim.
+Per-modality content of the expected-answer file:
+
+- MC: the `correct_choice` string (e.g., `"B"`).
+- TF: the boolean rendered as the same string the student submits (per modality convention — `"true"` / `"false"`).
+- SA: the `expected` string verbatim.
 
 These files are derived: any change to the marking scheme that affects
 non-coding expected answers triggers a re-materialization of the
-relevant files before the next save returns. Asset-write semantics
-(idempotency, ordering, atomicity across questions) are the runtime
-RFD's concern; this RFD commits only to the data dependency.
+relevant files before the next save returns. The materialization step
+also re-publishes the `marking.expected_file` path into the document's
+synthetic view used at parse phase. Asset-write semantics (idempotency,
+ordering, atomicity across questions, exact path scheme) are the
+runtime RFD's concern; this RFD commits only to the data dependency
+and the contract that the pipeline reads paths from the document, not
+from convention.
 
 ### Question-ID constraint
 
@@ -644,7 +675,7 @@ pipeline "mc" {
         content {
           args = [
             "${scenario.value.id}.txt",
-            "examination-assets/mc/${scenario.value.id}.expected",
+            scenario.value.marking.expected_file,
           ]
         }
       }
@@ -685,9 +716,11 @@ declaration in the formula, and one component `"tf"` whose `score`
 expression iterates `pipeline.tf.scenarios` with the same per-question
 marks logic.
 
-**SA questions.** One batched pipeline `"sa"`. Because `match_options`
-vary per question, the generator emits **static scenarios** rather than
-a uniform dynamic block:
+**SA questions.** One batched pipeline `"sa"`, symmetric with MC and TF.
+Per-question `match_options` (translated to `diff` flags) and the
+expected-answer file path both flow through `document.examination.questions[<id>].marking.<...>`
+under the relaxed RFD 0013 contract, so the generator can emit a
+uniform dynamic block rather than per-question static scenarios:
 
 ```hcl
 pipeline "sa" {
@@ -699,22 +732,38 @@ pipeline "sa" {
       command    = "diff"
       stdin_path = "/dev/null"
 
-      scenario "q4" {
-        args = ["--ignore-case", "q4.txt", "examination-assets/sa/q4.expected"]
+      dynamic "scenario" {
+        for_each = [for q in document.examination.questions : q if q.type == "sa"]
+        labels   = [scenario.value.id]
+        content {
+          args = concat(
+            scenario.value.marking.diff_flags,
+            [
+              "${scenario.value.id}.txt",
+              scenario.value.marking.expected_file,
+            ]
+          )
+        }
       }
-      scenario "q7" {
-        args = ["--ignore-case", "--ignore-all-space",
-                "q7.txt", "examination-assets/sa/q7.expected"]
-      }
-      # ...one static scenario per SA question, with its diff flags inlined.
     }
   }
 }
 ```
 
-The component is the same shape as MC's (with `pipeline.sa.scenarios`
-iteration); the formula also receives a `pipeline "sa" {}` declaration
-at top level. Per-question marks awarded on `diff` success.
+The generator translates each SA marking-scheme entry's `match_options`
+booleans into the corresponding `diff` flag list before publishing the
+document's synthetic view. Specifically:
+
+- `ignore_case` → `--ignore-case`
+- `ignore_all_whitespace` → `--ignore-all-space`
+- `strip_trailing_cr` → `--strip-trailing-cr`
+- `ignore_blank_lines` → `--ignore-blank-lines`
+
+`scenario.value.marking.diff_flags` is a `list(string)` of selected
+flags (empty list if none are set). The component is the same shape
+as MC's (with `pipeline.sa.scenarios` iteration); the formula also
+receives a `pipeline "sa" {}` declaration at top level. Per-question
+marks awarded on `diff` success.
 
 **Essay questions.** Not emitted in the pipeline. The default
 scoring-policy `max_score` filters them out
@@ -1174,3 +1223,25 @@ covers the canonical-state-at-save guarantee, any subsequent edit
 re-triggers materialization, and the second run adds a write-race
 surface against concurrent saves. The column is authoritative;
 grading reads it as-is.
+
+### Hardcoded `examination-assets/<modality>/<qid>.expected` path convention
+
+An earlier draft committed the generator (and the assembled pipeline
+HCL) to writing and reading expected-answer files at the literal
+filesystem path `examination-assets/<modality>/<qid>.expected`.
+Rejected after relaxing RFD 0013's pipeline-scope contract: the
+pipeline now reads the path via `document.examination.questions[<id>].marking.expected_file`,
+so the layout is a generator/runtime implementation detail rather than
+a contract. The runtime can move files, version them, namespace them
+per submission, or use object-storage URIs — none of which require an
+RFD update or a regenerated pipeline.
+
+### Static SA scenarios
+
+An earlier draft emitted SA grading as static `scenario "qN" {...}`
+blocks per question, with `diff_flags` inlined as HCL literals. This
+was a workaround for the stricter pre-relaxation pipeline-scope
+contract that didn't expose marking data. When RFD 0013 was relaxed
+to expose `marking.expected_file` and `marking.diff_flags` to the
+pipeline, the workaround dissolved — SA emits a uniform `dynamic
+"scenario"` block symmetric with MC and TF.
