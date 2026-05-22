@@ -482,8 +482,29 @@ The supported function set is small and side-effect-free:
 | `merge(map, map, ...)` | → `map` | Map merge (later keys win). |
 | `length(coll)` | → `number` | Element count of a list, map, set, or string. |
 | `sum(list)` | → `number` | Sum of a list of numbers. Empty list yields 0. |
+| `alltrue(list)` | → `bool` | True iff every element is `true`. Empty list yields `true`. Null elements are treated as `false`. |
+| `anytrue(list)` | → `bool` | True iff at least one element is `true`. Empty list yields `false`. Null elements are treated as `false`. |
+| `succeeded(result)` | → `bool` | True iff the given `exec_result` represents a successful execution (`exit_code == 0 && !timed_out && !skipped && error == null`). **Null-permissive**: returns `false` if the argument is null or a missing field path (so `succeeded(s.test)` works even when `s.test` is absent). |
+| `failed(result)` | → `bool` | Symmetric: true iff the execution ran but exited non-zero, timed out, or errored. Skipped scenarios yield `false`. Null/missing argument yields `false`. |
 
 All functions are pure: no filesystem access, no network, no external state. Functions that read from disk (e.g., `file()`, `fileset()`) or compile regex patterns (`regex()`) are deliberately *not* included — they couple parse-time to runtime state and undermine the parse-time-frozen guarantee.
+
+The `succeeded`/`failed` pair is the formula's canonical predicate for "did this exec block complete cleanly?" — neutral language since the same predicate is meaningful for a `compile` exec (compilation succeeded), an `execute` exec (binary ran cleanly), or a `test` exec (e.g., diff exited zero, meaning outputs matched). The author interprets the meaning per-stage; the predicate is uniform.
+
+Typical formula patterns without `try()`:
+
+```hcl
+# Count scenarios that passed the test stage
+score = length([for _, s in pipeline_results : 1 if succeeded(s.test)]) * 10
+
+# Per-question marks from the exam, awarded only on success
+score = sum([for code, s in pipeline_results :
+             document.examination.questions[code].marks
+             if succeeded(s.test)])
+
+# All-or-nothing for a question with multiple test cases
+score = alltrue([for _, s in pipeline_results : succeeded(s.test)]) ? 30 : 0
+```
 
 ## Result emission contract
 

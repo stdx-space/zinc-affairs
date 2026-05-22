@@ -34,9 +34,9 @@ component "q1" {
   max_score = document.examination.questions["q1"].marks
 
   score = (
-    (try(pipeline_results["small"].test.exit_code,  -1) == 0 ? document.examination.questions["q1"].marks * 0.20 : 0) +
-    (try(pipeline_results["medium"].test.exit_code, -1) == 0 ? document.examination.questions["q1"].marks * 0.30 : 0) +
-    (try(pipeline_results["large"].test.exit_code,  -1) == 0 ? document.examination.questions["q1"].marks * 0.50 : 0)
+    (succeeded(pipeline_results["small"].test)  ? document.examination.questions["q1"].marks * 0.20 : 0) +
+    (succeeded(pipeline_results["medium"].test) ? document.examination.questions["q1"].marks * 0.30 : 0) +
+    (succeeded(pipeline_results["large"].test)  ? document.examination.questions["q1"].marks * 0.50 : 0)
   )
 }
 
@@ -50,11 +50,11 @@ component "q2" {
   from      = "programming-q2"
   max_score = document.examination.questions["q2"].marks
 
-  score = (
-    try(pipeline_results["tree"].test.exit_code,   -1) == 0 &&
-    try(pipeline_results["cyclic"].test.exit_code, -1) == 0 &&
-    try(pipeline_results["dense"].test.exit_code,  -1) == 0
-  ) ? document.examination.questions["q2"].marks : 0
+  score = alltrue([
+    succeeded(pipeline_results["tree"].test),
+    succeeded(pipeline_results["cyclic"].test),
+    succeeded(pipeline_results["dense"].test),
+  ]) ? document.examination.questions["q2"].marks : 0
 }
 
 # -------------------------------------------------------------------
@@ -70,7 +70,7 @@ component "mc_total" {
 
   score = sum([for code, sc in pipeline_results :
                document.examination.questions[code].marks
-               if try(sc.test.exit_code, -1) == 0])
+               if succeeded(sc.test)])
 }
 
 # -------------------------------------------------------------------
