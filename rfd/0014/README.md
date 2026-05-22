@@ -113,6 +113,13 @@ modalities.
 - **Multi-language coding-question authoring.** The
   `CodingModalityInfo` blob is unchanged by this RFD. Per-language
   build/test conventions live in the instructor's authored fragment.
+- **Language-template library content.** RFD 0014 commits to the
+  existence of a "Load language template" picker in the inline HCL
+  drawer (see [Load-language-template picker](#load-language-template-picker)),
+  but the actual library — which languages are supported, what each
+  template contains, how templates version and update — is an
+  operational concern handled outside the RFD process. Templates can
+  be added, removed, or revised without bumping this RFD.
 - **Class-bound (reusable across activities) configs.** v2 allowed one
   config to be attached to many activities. v3 makes this impossible
   by design (see [Cardinality](#cardinality)).
@@ -491,77 +498,90 @@ Because modality is immutable, the lifecycle is simple:
 
 | Event | Effect on `grading_hcl` |
 |---|---|
-| Question created with `type = "coding"` | `grading_hcl` initialised with the TODO template (see below) as part of the initial marking-scheme version. |
+| Question created with `type = "coding"` | `grading_hcl` initialised with the no-op placeholder (see below) as part of the initial marking-scheme version. The instructor replaces this by loading a language template from the Documents-tab picker. |
 | Question's marking scheme edited (HCL change) | New marking-scheme version contains the new HCL. |
 | Question deleted | Marking scheme cascades through `marking_scheme_meta`'s FK to the question. |
 
 No archive column, no modality-flip handling, no soft-delete state.
 
-### TODO template
+### Default no-op placeholder
 
 The default `grading_hcl` populated when a coding question is created
-(placeholder language: C++; instructors change it):
+is a **no-op** — a pipeline that runs cleanly and a component that
+scores zero. The real starting point comes from the
+[Load-language-template picker](#load-language-template-picker) the
+instructor uses next:
 
 ```hcl
 pipeline "<qid>" {
   description = "<question's display name>"
 
-  stage "compile" {
+  # Placeholder pipeline. Use the "Load language template" action in
+  # the inline HCL drawer to populate a working starting point for
+  # your chosen language (Python, Java, C++, Go, etc.); then
+  # customize. Until then, this stage runs cleanly and the component
+  # below scores 0.
+  stage "placeholder" {
     exec {
-      command = "g++"
-      args    = ["-o", "<qid>.out", "<qid>.cpp"]
-      timeout = "10s"
-    }
-  }
-
-  stage "execute" {
-    exec {
-      command = "./<qid>.out"
-      # TODO: declare one scenario per test case.
-      scenario "test1" {
-        stdout_path = "test1.out"
-      }
-    }
-  }
-
-  stage "test" {
-    visibility {
-      filter { effect = "hide"; until = "collection_stop" }
-    }
-    exec {
-      command = "diff"
-      scenario "test1" {
-        args = ["test1.out", "examination-assets/<qid>/test1.expected"]
-      }
+      command = "true"
     }
   }
 }
 
 component "<qid>" {
   max_score = document.examination.questions["<qid>"].marks
-  # All-or-nothing default over the declared test cases.
-  # Replace ["test1"] with the full list of scenario codes if you
-  # add more scenarios; or rewrite for partial-credit semantics.
-  # Bracket-indexed access on `pipeline` is used because question IDs
-  # may contain dashes — `pipeline.<qid>` only works for bare HCL
-  # identifiers.
-  score = alltrue([for code in ["test1"] :
-                   succeeded(pipeline["<qid>"].scenarios[code].test)])
-            ? document.examination.questions["<qid>"].marks
-            : 0
+  # Placeholder: scores 0 until the pipeline is configured. The
+  # conservative default ensures an unconfigured coding question never
+  # accidentally awards full marks; the instructor sees an obvious
+  # "this question always scores 0" signal during testing and replaces
+  # this expression when authoring real grading logic.
+  score = 0
 }
 ```
 
-**Iteration over an explicit scenario-code list, not over
-`pipeline["<qid>"].scenarios` directly.** RFD 0013 documents that
-`pipeline.<name>.scenarios` has heterogeneous keys — e.g., the
-`compile` stage contributes a `"default"` scenario that has no `test`
-entry. A naive `for _, s in pipeline["<qid>"].scenarios :
-succeeded(s.test)` returns `false` for the `"default"` entry (since
-`s.test` is null and `succeeded(null)` is `false`), so `alltrue`
-always returns `false` even when every real test case passes. The
-template uses an explicit list to avoid this trap; the comment tells
-the instructor where to extend it as they add scenarios.
+This default is chosen deliberately:
+
+- **It materializes successfully.** No references to files that don't
+  yet exist; no language-specific compiler invocation that fails for
+  the wrong language. The generator can assemble the full config the
+  instant the question is created, and the read-only preview shows a
+  valid (if uninteresting) grading config.
+- **It's language-agnostic.** A hardcoded C++/Python/Java stub would
+  guess wrong for most questions and force the instructor to delete
+  most of it before starting. The Load-language-template action does
+  the language-specific scaffolding properly.
+- **It scores zero, not full marks.** An exam shipped with one
+  un-configured coding question awards zero on that question, not
+  full marks. That's the safer failure mode — the instructor notices
+  during testing that students aren't getting credit, rather than
+  noticing after the exam that students got marks they shouldn't
+  have.
+- **It avoids RFD 0013's heterogeneous-keys trap by construction.**
+  The placeholder declares no scenarios, so there's no iteration over
+  `pipeline["<qid>"].scenarios` to get wrong. The language templates
+  the instructor loads next demonstrate the safe iteration pattern
+  (explicit scenario-code list, per RFD 0013) when they declare real
+  test cases.
+
+### Load-language-template picker
+
+The inline HCL drawer (see [Editorial surface](#editorial-surface))
+exposes a **"Load language template"** action prominently when the
+fragment is still the no-op default. Clicking it opens a picker
+listing supported language templates (Python, Java, C++, Go, etc.);
+selecting one replaces the `grading_hcl` content with the chosen
+template's content. Subsequent edits are the instructor's
+responsibility.
+
+The set of language templates is an **operational artifact** —
+shipped, versioned, and updated independently of this RFD. The v3
+contract commits only to "templates exist and are loadable;" the
+actual Python or Java template content can evolve without an RFD
+update.
+
+If the instructor wants to load a different language template later,
+the same picker remains available in the drawer; it warns before
+overwriting non-placeholder content.
 
 ### Editorial surface
 
@@ -580,6 +600,14 @@ Mechanics:
 - The drawer contains a single HCL editor (Monaco-based or equivalent)
   with live diagnostics from the lint endpoint
   ([Linting](#linting)).
+- A **"Load language template"** action appears prominently in the
+  drawer chrome when the current `grading_hcl` is the no-op placeholder
+  (and remains available, with an overwrite warning, after the
+  fragment has been customized). The picker lists the supported
+  language templates (Python, Java, C++, Go, ...); selecting one
+  replaces the editor content with that template. The template
+  library is operational — what languages exist and what each
+  template contains is not pinned in this RFD.
 - Save commits the new HCL into a fresh marking-scheme version for
   the question.
 
@@ -604,9 +632,10 @@ locals into a single top-level `locals` block in the assembled file.
 Conflict resolution: **duplicate keys across fragments (or between a
 fragment and generator-emitted locals) are materialization errors.**
 The error message names the colliding key and the offending fragment.
-The TODO template avoids declaring locals to sidestep this trap for
-the common case; instructors who refactor to use locals do so with
-awareness of the shared namespace.
+The no-op placeholder default declares no locals, sidestepping this
+trap until the instructor loads a language template; templates with
+locals declare them under qid-prefixed names (e.g., `local.<qid>_test_codes`)
+to minimize collision likelihood.
 
 (In v1 the generator emits no locals of its own, so the only conflict
 surface is between coding fragments. v2 of the generator may emit
@@ -870,7 +899,12 @@ The Documents tab is the canonical authoring locus. The redesign:
   marking-scheme fields inline (marks, correct answer / match-options
   /  `answer` per modality).
 - For coding questions only, an additional "Grading pipeline" section
-  with an "Edit pipeline" button that opens the inline HCL drawer.
+  with an "Edit pipeline" button that opens the inline HCL drawer. The
+  drawer opens with the [no-op placeholder](#default-no-op-placeholder)
+  when the question is freshly created; a prominent
+  ["Load language template"](#load-language-template-picker) action
+  inside the drawer offers the picker for the instructor's first
+  meaningful edit.
 
 ### Bulk marks view — the primary rubric-completion flow
 
@@ -1245,3 +1279,30 @@ contract that didn't expose marking data. When RFD 0013 was relaxed
 to expose `marking.expected_file` and `marking.diff_flags` to the
 pipeline, the workaround dissolved — SA emits a uniform `dynamic
 "scenario"` block symmetric with MC and TF.
+
+### C++ TODO template as the default coding fragment
+
+An earlier draft populated new coding-question `grading_hcl` with a
+hardcoded C++ compile/execute/test template containing TODO comments
+for the instructor to fill in. Rejected for three reasons:
+
+- **Language guess.** The template guessed C++; instructors writing
+  Python, Java, Go, or anything else had to rewrite most of it before
+  it worked. The guess was no help; it was a starting line the
+  instructor had to delete.
+- **Broken on materialization.** The template referenced files
+  (`<qid>.cpp`, `test1.expected`) that don't exist for a freshly
+  created question. The assembled config materialized cleanly but
+  failed at grading-time with confusing errors that traced back to
+  missing fixtures, not to "you haven't configured this question."
+- **No clean place for the right starting point.** Real per-language
+  scaffolding (Python's compile-step-skip, Java's package management,
+  Go's module setup, etc.) doesn't fit in one universal template.
+  The right shape is a library of language templates with a UI
+  picker — which is what we ship instead.
+
+The no-op default + language-template picker replaces the TODO
+template entirely. New coding questions get a fragment that
+materializes successfully, runs cleanly, and scores zero — making it
+obvious that real configuration is still needed, without producing
+crash-flavored errors during testing.
