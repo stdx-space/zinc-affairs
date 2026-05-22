@@ -24,6 +24,17 @@ document "examination" {
 }
 
 # -------------------------------------------------------------------
+# Pipeline declarations
+# -------------------------------------------------------------------
+# Every `pipeline.<name>` reference below must be grounded by a
+# matching declaration here. The validate phase catches missing
+# declarations as a local single-file check; the parse phase cross-
+# references these names against the paired pipeline config.
+pipeline "programming-q1" {}
+pipeline "programming-q2" {}
+pipeline "mc" {}
+
+# -------------------------------------------------------------------
 # Q1 — weighted per-scenario marks
 # -------------------------------------------------------------------
 # Each test scenario carries a different share of Q1's marks: `small`

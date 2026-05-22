@@ -144,6 +144,8 @@ locals {
   test_codes = ["test1", "test2", "test3"]
 }
 
+pipeline "programming-q1" {}
+
 component "q1" {
   max_score = document.examination.questions["q1"].marks
   score     = sum([for code in local.test_codes :
@@ -182,7 +184,7 @@ pipeline "name" {
 }
 ```
 
-- The label (here, `"name"`) is the pipeline's identifier. Any non-empty string is allowed; formulas reference the pipeline's results via the reserved top-level namespace `pipeline.<name>` (or `pipeline["<name>"]` when the label isn't a bare HCL identifier — e.g., contains dashes).
+- The label (here, `"name"`) is the pipeline's identifier. Labels must match `[a-zA-Z0-9_-]+` — the same character class as scenario codes — to keep names safe across HCL syntax (dotted vs bracketed access) and downstream paths. Formulas reference the pipeline's results via the reserved top-level namespace `pipeline.<name>` (or `pipeline["<name>"]` when the label isn't a bare HCL identifier — e.g., contains dashes).
 - Multiple pipelines in one config are allowed and are the norm for examination cases.
 - Pipelines are independent: no shared state, no inter-pipeline `depends_on`, no cross-pipeline references in HCL. They execute in parallel at runtime.
 - A pipeline must contain at least one `stage` block (after dynamic expansion).
@@ -580,7 +582,7 @@ URIs are opaque to the formula — it never parses them. The runtime RFD picks t
 
 ### The `pipeline` namespace
 
-Formulas access pipeline-run data through a reserved top-level namespace `pipeline`. For each pipeline declared in the paired pipeline config, the runtime injects an entry `pipeline.<name>` (or `pipeline["<name>"]` for non-identifier names) whose `scenarios` attribute is a scenario-keyed map.
+Formulas access pipeline-run data through a reserved top-level namespace `pipeline`. The namespace is grounded by `pipeline "<name>" {}` declaration blocks at the top level of the formula file (see [Pipeline declaration block](#pipeline-declaration-block)); for each declared name, the runtime injects an entry `pipeline.<name>` (or `pipeline["<name>"]` for non-identifier names) whose `scenarios` attribute is a scenario-keyed map.
 
 ```hcl
 pipeline = {
@@ -603,14 +605,14 @@ pipeline = {
 }
 ```
 
-The namespace is **reserved** (instructors can't declare their own `pipeline` value via `locals`) and **runtime-injected** (resolved once the pipeline runs complete, before formula evaluation begins). It sits alongside the other reserved namespaces in formula scope: `local.<name>` (author-declared), `document.<type>` (parse-phase-resolved), `pipeline.<name>` (runtime-resolved).
+The namespace is **reserved** (instructors can't redefine `pipeline` via `locals`) and **runtime-injected** (resolved once the pipeline runs complete, before formula evaluation begins). It sits alongside the other reserved namespaces in formula scope, each grounded in its own block declaration: `local.<name>` from `locals {}` (parse-phase-resolved), `document.<type>` from `document "<type>" {}` (parse-phase-resolved), `pipeline.<name>` from `pipeline "<name>" {}` (runtime-resolved).
 
 **Where `pipeline.<name>` is in scope.** Only inside expressions that evaluate against runtime data:
 
 - `component.score`
 - `scoring.total`
 
-`pipeline.<name>` is **not** in scope in expressions that resolve at parse phase: `locals { ... }`, `component.max_score`, `dynamic` block `for_each`, etc. Referencing it from those contexts is a parse-phase error.
+`pipeline.<name>` is **not** in scope in expressions that resolve at parse phase: `locals { ... }`, `component.max_score`, `dynamic` block `for_each`, etc. Referencing it from those contexts is a validate-phase error — independent of whether the pipeline is declared.
 
 <a id="pipelinenamescenarios-schema"></a>
 #### `pipeline.<name>.scenarios` schema
@@ -648,20 +650,54 @@ A formula config is one HCL file containing:
 - **`version = 3`** — required.
 - **`locals { ... }`** — optional, at most one. Same semantics as pipeline locals.
 - **`document "<type>" { id = ... }`** — optional. Same semantics as pipeline document.
+- **`pipeline "<name>" { ... }`** — zero or more (static, dynamic, or mixed). Declares that this formula consumes the named pipeline from the paired pipeline config. The block introduces `pipeline.<name>` into the runtime-evaluated expression scope. See [Pipeline declaration block](#pipeline-declaration-block).
 - **`component "<name>" { ... }`** — one or more (static, dynamic, or mixed).
 - **`scoring { ... }`** — required, exactly one.
 
 The formula and pipeline files declare `locals` and `document` independently — they are separate HCL documents stored in separate database rows.
 
-Three reserved namespaces are available inside the file's expressions, each with distinct resolution semantics:
+Three reserved namespaces are available inside the file's expressions, each with distinct resolution semantics, and each grounded in a block declaration:
 
-| Namespace | Source | When resolved | Available in |
+| Namespace | Declared via | When resolved | Available in |
 |---|---|---|---|
-| `local.<name>` | Author-declared in `locals { ... }` | Parse phase | Everywhere |
-| `document.<type>` | Block-declared via `document "<type>" {}`; fetched from the examination service | Parse phase | Everywhere |
-| `pipeline.<name>` | Reserved; populated by the runtime from the paired pipeline config's `pipeline "<name>" { ... }` blocks | Runtime (after pipeline runs complete) | Only inside `component.score` and `scoring.total` |
+| `local.<name>` | `locals { foo = ... }` block | Parse phase | Everywhere |
+| `document.<type>` | `document "<type>" { id = ... }` block; fetched from the examination service | Parse phase | Everywhere |
+| `pipeline.<name>` | `pipeline "<name>" { ... }` block; populated by the runtime from the paired pipeline config | Runtime (after pipeline runs complete) | Only inside `component.score` and `scoring.total` |
 
-Authors cannot declare a `pipeline` value via `locals` (the name is reserved) and cannot reference `pipeline.<name>` from parse-phase contexts (`max_score`, `dynamic` block `for_each`, etc.) — those references are parse-phase errors. See [The `pipeline` namespace](#the-pipeline-namespace).
+A `pipeline.<name>` reference is a validate-phase error if no matching `pipeline "<name>" {}` declaration is present in the same formula file. References from parse-phase contexts (`max_score`, `dynamic` block `for_each`, etc.) are validate-phase errors regardless of declaration. See [Pipeline declaration block](#pipeline-declaration-block) and [The `pipeline` namespace](#the-pipeline-namespace).
+
+### Pipeline declaration block
+
+```hcl
+pipeline "main" {}
+pipeline "programming-q1" {}
+pipeline "mc" {}
+```
+
+Each `pipeline "<name>" {}` block declares that the formula consumes the named pipeline from the paired pipeline config. The block label is the pipeline name (matching the `pipeline "<name>" { ... }` label in the pipeline file); the block body is empty in v3.
+
+**Why declare.** Declaration grounds the `pipeline.<name>` reserved namespace, parallel to how `locals { ... }` grounds `local.<name>` and `document "<type>" {}` grounds `document.<type>`. Without a declaration, `pipeline.<name>` references are validate-phase errors — a local check that the editor can run as the author types, without needing to read the paired pipeline config.
+
+**Constraints:**
+
+- The block label must be a valid scenario-code pattern (`[a-zA-Z0-9_-]+`) — same constraint pipeline labels carry in the pipeline file.
+- Duplicate `pipeline` labels in one formula are a validate-phase error.
+- The v3 block body is empty; setting attributes is a validate-phase error. (Future RFDs may introduce attributes — e.g., `required = true`, an alias, or a result-filter projection — without breaking the v3 contract.)
+- A declared but unreferenced pipeline raises a validate-phase warning (typo guard); the formula still validates.
+- An undeclared `pipeline.<name>` reference in `component.score` or `scoring.total` is a validate-phase error.
+- Parse-phase: the declared pipeline name must match a `pipeline "<name>" { ... }` block in the paired pipeline config. Mismatched declarations fail the parse phase before grading dispatches.
+
+**Dynamic declarations.** Formulas whose set of consumed pipelines depends on the examination document (e.g., one pipeline per coding question) use a `dynamic "pipeline"` block at the top level:
+
+```hcl
+dynamic "pipeline" {
+  for_each = [for q in document.examination.questions : q if q.type == "coding"]
+  labels   = ["programming-${each.value.id}"]
+  content {}
+}
+```
+
+The block expands at the parse phase, after `document` resolution, into one `pipeline "..." {}` declaration per iteration. This matches the existing `dynamic "component"` and `dynamic "scenario"` patterns.
 
 ### Component block
 
@@ -682,7 +718,7 @@ component "correctness" {
 - `weight` — number, **must be positive**, default 1. Free-form metadata accessible in `scoring.total` as `<component_name>.weight`. UI may surface it in rubric displays.
 - `min_score` — number, default 0. Floor on the resolved `score`. Set to a negative number to allow a deduction-style component (e.g., a "style penalty" component whose `score` expression yields negative values for accumulated issues).
 
-**No `from` attribute.** Components do not declare a source pipeline. Each `pipeline.<name>` reference inside the `score` expression *is* the dependency declaration — the runtime statically scans the expression for `pipeline.<name>` / `pipeline["<name>"]` references and validates each against the paired pipeline config at the parse phase. This is symmetric with how `document.examination.questions[...]` references are validated: the reference itself is the declaration.
+**No `from` attribute.** Components do not declare a source pipeline. Pipeline dependencies are declared at the *file* level via top-level `pipeline "<name>" {}` blocks (see [Pipeline declaration block](#pipeline-declaration-block)); a component's `score` expression then references the declared namespaces directly. This is symmetric with `document.examination.questions[...]` references — the `document "examination" {}` declaration grounds the namespace, and components reference it without re-declaring.
 
 **Scenario codes can collide across pipelines without conflict.** Because the namespace is `pipeline.<name>.scenarios[<code>]`, two pipelines can each have a scenario `"test1"` — `pipeline.q1.scenarios["test1"]` and `pipeline.q2.scenarios["test1"]` are distinct values.
 
@@ -753,6 +789,8 @@ locals {
   scenario_marks = { test1 = 3, test2 = 5, test3 = 12 }
 }
 
+pipeline "main" {}
+
 component "correctness" {
   max_score = sum([for k, v in local.scenario_marks : v])
   score     = sum([for code, sc in pipeline.main.scenarios :
@@ -778,6 +816,17 @@ scoring {
 version = 3
 
 document "examination" { id = 1 }
+
+# Declare all consumed pipelines: one per coding question (dynamic) plus
+# the batched mc pipeline (static). Declarations expand at parse phase
+# after document resolution.
+dynamic "pipeline" {
+  for_each = [for q in document.examination.questions : q if q.type == "coding"]
+  labels   = ["programming-${each.value.id}"]
+  content {}
+}
+
+pipeline "mc" {}
 
 # One component per coding question
 dynamic "component" {
@@ -818,7 +867,7 @@ The split matters because some errors are only knowable with external data (does
 Caught with HCL diagnostics including source line/column. Single-file checks, no external dependencies:
 
 - `version` attribute missing, not an integer, or not equal to 3.
-- Duplicate `pipeline` labels in a config.
+- Duplicate `pipeline` labels in a config (pipeline file: duplicate top-level `pipeline "name" { ... }` blocks; formula file: duplicate top-level `pipeline "name" {}` declaration blocks).
 - Duplicate `component` labels in a formula.
 - Duplicate `stage` labels within a pipeline.
 - Duplicate `scenario` codes within a stage.
@@ -835,7 +884,10 @@ Caught with HCL diagnostics including source line/column. Single-file checks, no
 - Visibility filter with `effect` other than `"hide"`/`"none"`, `selector` containing an undefined value, `when`/`until` containing an undefined condition.
 - `total` expression in scoring referencing an undefined component name.
 - Required attribute missing on `component` (`max_score`, `score`) or `scoring` (`max_score`).
-- A `pipeline.<name>` or `pipeline["<name>"]` reference appearing inside a parse-phase context (`locals { ... }`, `component.max_score`, `dynamic` block `for_each`, etc.) where only parse-resolved values are available.
+- A `pipeline.<name>` or `pipeline["<name>"]` reference in `component.score` or `scoring.total` without a matching `pipeline "<name>" {}` declaration block in the same formula. (Local, single-file check.)
+- A `pipeline.<name>` or `pipeline["<name>"]` reference appearing inside a parse-phase context (`locals { ... }`, `component.max_score`, `dynamic` block `for_each`, etc.) where only parse-resolved values are available — regardless of whether the pipeline is declared.
+- A `pipeline "<name>" {}` declaration block with a non-empty body in v3 (no attributes are defined yet; reserved for future RFDs).
+- A `pipeline "<name>" {}` declaration label not matching `[a-zA-Z0-9_-]+`.
 - A scenario code (static label or dynamic `labels` result) not matching `[a-zA-Z0-9_-]+`.
 - A `dynamic` block missing both `for_each` and `content`.
 - Function calls to functions outside the supported set.
@@ -852,12 +904,13 @@ These produce parser warnings rather than errors. The config still validates, bu
 
 - Scenario codes that appear in one stage of a pipeline but not in symmetric form across all "downstream" stages that consume them. Catches `test1` vs `Test1` typos that would otherwise silently produce `score = 0`.
 - `args` re-declared at scenario level when exec level also sets `args` without using `concat(local.base, ...)` — suggests the idiomatic shared-prefix pattern.
+- `pipeline "<name>" {}` declared in a formula but no reference to `pipeline.<name>` (or `pipeline["<name>"]`) appears in any score or scoring expression. The declaration validates but the warning flags likely unused-import-style typos before parse phase.
 
 ### Parse phase (cross-file + external resolution)
 
 Caught at grading workflow start, before any dispatch. Failures here fail the run with a structured error that surfaces to the instructor:
 
-- A `pipeline.<name>` or `pipeline["<name>"]` reference inside a `component.score` or `scoring.total` expression that does not resolve to a pipeline declared in the paired pipeline config. Each such reference in the formula is statically scanned for; expansion of `dynamic "component"` blocks may produce additional references, which are validated post-expansion.
+- A `pipeline "<name>" {}` declaration block in the formula whose label has no matching `pipeline "<name>" { ... }` block in the paired pipeline config. (The validate-phase check ensures references match declarations within the formula; this parse-phase check ensures declarations match the pipeline file across the pair. Dynamic `pipeline` declarations are validated post-expansion against the resolved examination document.)
 - `document "examination" { id = X }` declared in both pipeline and formula configs with different `id` values.
 - A `document` block reference (`document.examination.questions["q1"]`) to a question id that does not exist in the resolved examination.
 - A `document` block reference to a field not in the committed contract for that document type (e.g., `document.examination.questions["q1"].marks` from a *pipeline* — `marks` is only in scope in the formula contract).
@@ -939,6 +992,16 @@ Considered making the source declaration a sub-block (`pipeline "<name>" {}` ins
 ### Naming variants: `result.scenarios`, `source.scenarios`, etc.
 
 Considered keeping the `from` attribute but renaming the runtime variable to `result.scenarios` or `source.scenarios` (matching a renamed attribute). Rejected because both options keep the `from`/data redundancy and don't match the `<reserved-namespace>.<name>.<...>` shape of `document.<type>.<...>`. `pipeline.<name>.scenarios[<code>]` is parallel to `document.examination.questions["q1"]` — the same dotted "namespace dot name dot member" shape — which is the strongest mental-model anchor v3 has.
+
+### Implicit `pipeline.<name>` namespace without declaration
+
+An earlier draft made `pipeline.<name>` a top-level reserved namespace populated implicitly from the paired pipeline config — no `pipeline "<name>" {}` declaration in the formula was required. Rejected for three reasons:
+
+- **Asymmetry with the other reserved namespaces.** `local.<name>` is grounded by `locals { ... }`; `document.<type>` is grounded by `document "<type>" {}`. Leaving `pipeline.<name>` un-grounded made it the outlier — the same shape complaint that retired the original `pipeline_results` variable, just moved up a level.
+- **Validation locality.** Without declarations, checking that a `pipeline.<name>` reference resolves required reading the paired pipeline config — a cross-file step. The validate-phase contract for the editor says single-file, schema-only; declarations let the editor catch typos as the author types, without round-tripping to the pipeline file.
+- **No home for future per-pipeline options.** A formula may eventually want to express per-pipeline metadata (e.g., `required = false`, an alias, a result-filter projection). Without declaration blocks there's no obvious place to put those attributes. The block syntax reserves the space even though v3 ships with empty bodies.
+
+The declaration block is empty in v3 and feels like boilerplate for the simple case, but the consistency and validation wins outweigh the one-line cost per consumed pipeline.
 
 ## Out of scope
 
