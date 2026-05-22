@@ -421,7 +421,7 @@ document "examination" {
 - At most one block per type per file. Two `document "examination" {}` blocks are a parse error.
 - **Resolved at the parse phase** — the runtime fetches the document once when grading begins and injects it as a static HCL variable. Subsequent changes to the document do not affect already-parsed runs.
 
-When declared, `document.examination` is in scope throughout the file and exposes a contract that **differs between pipeline and formula** — the formula sees scoring metadata that the pipeline deliberately does not.
+When declared, `document.examination` is in scope throughout the file and exposes a contract that **differs slightly between pipeline and formula** — the formula additionally sees per-question `marks`. Both scopes see the rest of the marking scheme.
 
 **In the pipeline** (`document.examination`):
 
@@ -429,8 +429,31 @@ When declared, `document.examination` is in scope throughout the file and expose
 {
   id        = 1
   questions = {
-    "q1" = { id = "q1", type = "coding", ... }
-    "q2" = { id = "q2", type = "mc",     ... }
+    "q1" = {
+      id      = "q1"
+      type    = "coding"
+      # Coding questions carry no auto-grading rubric here — the
+      # instructor's authored pipeline + formula component IS the rubric.
+    }
+    "q2" = {
+      id      = "q2"
+      type    = "mc"
+      marking = {
+        # Modality-specific rubric data (defined by the marking-scheme
+        # schema in the integration RFD). Per-modality fields exposed to
+        # the pipeline include the expected-answer file path the test
+        # stage diffs against, and any per-question matching rules.
+        expected_file = "<runtime-chosen path>"
+      }
+    }
+    "q4" = {
+      id      = "q4"
+      type    = "sa"
+      marking = {
+        expected_file = "<runtime-chosen path>"
+        diff_flags    = ["--ignore-case"]
+      }
+    }
     ...
   }
 }
@@ -439,7 +462,10 @@ When declared, `document.examination` is in scope throughout the file and expose
 Committed fields (must be present, types stable):
 - `id` (int)
 - `questions` (map keyed by question id)
-- Each question: `id` (string), `type` (string — values from the answer-modality registry: `"mc"`, `"tf"`, `"sa"` (short-answer), `"essay"`, `"coding"`)
+- Each question:
+  - `id` (string)
+  - `type` (string — values from the answer-modality registry: `"mc"`, `"tf"`, `"sa"`, `"essay"`, `"coding"`)
+  - `marking` (object, per-modality shape) — present for any modality whose marking scheme carries data the pipeline needs to run tests; absent for `"coding"` (the instructor-authored fragment is the rubric) and `"essay"` (not auto-graded). The exact per-modality shape is defined by the marking-scheme schema in the integration RFD; the language RFD commits only to "this field is exposed when the modality has rubric data."
 
 **In the formula** (`document.examination`):
 
@@ -447,7 +473,8 @@ Committed fields (must be present, types stable):
 {
   id        = 1
   questions = {
-    "q1" = { id = "q1", type = "coding", marks = 30, ... }
+    "q1" = { id = "q1", type = "coding", marks = 30 }
+    "q2" = { id = "q2", type = "mc",     marks = 5,  marking = { ... } }
     ...
   }
 }
@@ -456,11 +483,11 @@ Committed fields (must be present, types stable):
 Same as the pipeline view, plus:
 - `marks` (number) on each question
 
-`marks` is exposed to the formula only because the pipeline is score-blind by design (per [Proposal](#proposal) decision 1). Splitting the contract by file kind enforces that principle at the parser level rather than relying on convention.
+**Why the split.** "The pipeline is score-blind" (per [Proposal](#proposal) decision 1) means the pipeline doesn't compute scores, doesn't know mark weights, and doesn't reference `formula.*` — *not* that the pipeline can't see the rubric. The pipeline needs marking data to actually run tests (knowing which choice is correct for MC, what diff flags to use for SA, what file holds the expected answer). The contract carve-out is exactly `marks`: that field is what would let the pipeline make scoring decisions. Everything else the marking scheme carries — expected answers, match rules, file paths — is available to both scopes. The parser enforces the carve-out at the namespace level; nothing else relies on convention.
 
-**Domain-extensible fields** (the examination service may add without bumping this RFD): `title`, `description`, `parts`, `correct_answer`, etc. Pipeline/formula authors use them at their own risk; existence is not guaranteed by this RFD.
+**Domain-extensible fields** (the examination service may add without bumping this RFD): `title`, `description`, `parts`, etc. Pipeline/formula authors use them at their own risk; existence is not guaranteed by this RFD.
 
-**Resolution.** The runtime resolves the examination document at the parse phase by joining the `examination.question`, `examination.answer_modality_meta`, and the active marking-scheme version pointed to by `marking_scheme_meta.active_version_id`. The flat `questions` map exposed to HCL is therefore a synthetic view assembled from multiple sources, not a 1:1 reflection of any single table. This resolution involves a cross-extension fetch (typically NATS), not a filesystem access — the "no `file()` function" restriction is about preventing arbitrary disk reads from HCL expressions, not about avoiding all external data resolution. The `marks` field on each question is sourced from the marking-scheme blob and is only resolved when parsing a formula (not when parsing a pipeline).
+**Resolution.** The runtime resolves the examination document at the parse phase by joining the `examination.question`, `examination.answer_modality_meta`, and the active marking-scheme version pointed to by `marking_scheme_meta.active_version_id`. The flat `questions` map exposed to HCL is therefore a synthetic view assembled from multiple sources, not a 1:1 reflection of any single table. This resolution involves a cross-extension fetch (typically NATS), not a filesystem access — the "no `file()` function" restriction is about preventing arbitrary disk reads from HCL expressions, not about avoiding all external data resolution. The `marks` field on each question is sourced from the marking-scheme blob and is filtered out of the pipeline's view of the synthetic record before injection; everything else flows through to both scopes.
 
 **Cross-file ID match.** The pipeline and formula configs are loaded together at the parse phase. The four declaration cases:
 
@@ -913,7 +940,7 @@ Caught at grading workflow start, before any dispatch. Failures here fail the ru
 - A `pipeline "<name>" {}` declaration block in the formula whose label has no matching `pipeline "<name>" { ... }` block in the paired pipeline config. (The validate-phase check ensures references match declarations within the formula; this parse-phase check ensures declarations match the pipeline file across the pair. Dynamic `pipeline` declarations are validated post-expansion against the resolved examination document.)
 - `document "examination" { id = X }` declared in both pipeline and formula configs with different `id` values.
 - A `document` block reference (`document.examination.questions["q1"]`) to a question id that does not exist in the resolved examination.
-- A `document` block reference to a field not in the committed contract for that document type (e.g., `document.examination.questions["q1"].marks` from a *pipeline* — `marks` is only in scope in the formula contract).
+- A `document` block reference to a field not in the committed contract for that document type — most commonly `document.examination.questions[<id>].marks` from a *pipeline* (marks is the one field carved out of pipeline scope; every other marking field is available to both).
 - Dynamic expansion produces zero stages or zero components after resolving `for_each` (the pipeline / formula would have nothing to execute or score).
 - A `pipeline_run.results` from a prior run reshaped into `pipeline.<name>.scenarios` whose shape doesn't match the contract (defensive — should never happen but flagged for observability).
 

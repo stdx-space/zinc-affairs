@@ -120,6 +120,12 @@ pipeline "programming-q2" {
 # for question `<qid>` is in `<qid>.txt` (uploaded by the exam runner),
 # and we diff it against the marking scheme's expected answer.
 #
+# The expected-answer file path is sourced from the document's
+# per-question `marking` field — the runtime resolves the path from
+# the marking-scheme blob and exposes it here. This is the v3 idiom:
+# the pipeline reads what it needs to test from the document, rather
+# than depending on a hardcoded asset-path convention.
+#
 # Generated as one scenario per MC question via a dynamic block driven
 # by the examination's question list.
 pipeline "mc" {
@@ -140,7 +146,7 @@ pipeline "mc" {
         content {
           args = concat(local.diff_flags, [
             "${scenario.value.id}.txt",
-            "examination-assets/mc/${scenario.value.id}.expected",
+            scenario.value.marking.expected_file,
           ])
         }
       }
