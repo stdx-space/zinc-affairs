@@ -29,14 +29,17 @@ document "examination" {
 # Each test scenario carries a different share of Q1's marks: `small`
 # is a sanity check, `large` is the load-bearing case. Explicit weights
 # rather than equal distribution.
+#
+# Pipeline data is read from the reserved top-level `pipeline.<name>`
+# namespace; bracket-indexed form is used here because "programming-q1"
+# contains a dash and isn't a bare HCL identifier.
 component "q1" {
-  from      = "programming-q1"
   max_score = document.examination.questions["q1"].marks
 
   score = (
-    (succeeded(pipeline_results["small"].test)  ? document.examination.questions["q1"].marks * 0.20 : 0) +
-    (succeeded(pipeline_results["medium"].test) ? document.examination.questions["q1"].marks * 0.30 : 0) +
-    (succeeded(pipeline_results["large"].test)  ? document.examination.questions["q1"].marks * 0.50 : 0)
+    (succeeded(pipeline["programming-q1"].scenarios["small"].test)  ? document.examination.questions["q1"].marks * 0.20 : 0) +
+    (succeeded(pipeline["programming-q1"].scenarios["medium"].test) ? document.examination.questions["q1"].marks * 0.30 : 0) +
+    (succeeded(pipeline["programming-q1"].scenarios["large"].test)  ? document.examination.questions["q1"].marks * 0.50 : 0)
   )
 }
 
@@ -47,13 +50,12 @@ component "q1" {
 # zero. Models a question where partial-credit doesn't make sense (e.g.,
 # the algorithm is correct or it isn't).
 component "q2" {
-  from      = "programming-q2"
   max_score = document.examination.questions["q2"].marks
 
   score = alltrue([
-    succeeded(pipeline_results["tree"].test),
-    succeeded(pipeline_results["cyclic"].test),
-    succeeded(pipeline_results["dense"].test),
+    succeeded(pipeline["programming-q2"].scenarios["tree"].test),
+    succeeded(pipeline["programming-q2"].scenarios["cyclic"].test),
+    succeeded(pipeline["programming-q2"].scenarios["dense"].test),
   ]) ? document.examination.questions["q2"].marks : 0
 }
 
@@ -65,10 +67,10 @@ component "q2" {
 # dynamic block's `labels`). Each question contributes its own marks
 # from the marking scheme if its diff passed.
 component "mc_total" {
-  from      = "mc"
   max_score = sum([for q in document.examination.questions : q.marks if q.type == "mc"])
 
-  score = sum([for code, sc in pipeline_results :
+  # "mc" is a bare HCL identifier, so dotted access works directly.
+  score = sum([for code, sc in pipeline.mc.scenarios :
                document.examination.questions[code].marks
                if succeeded(sc.test)])
 }

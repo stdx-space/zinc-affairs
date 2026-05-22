@@ -45,7 +45,7 @@ The current pipeline system has accumulated three layered problems that no incre
 - **Runtime architecture.** How `exec` blocks are dispatched, what isolation environment runs them, workflow orchestration (Temporal vs alternatives), worker lifecycle, container management. Covered by a forthcoming runtime RFD.
 - **Toolkit reusability.** A v3 pipeline can inline `exec` blocks directly. A future "toolkit" mechanism — reusable HCL macros that expand to `exec` blocks with parameter holes — is a separate RFD.
 - **Plugin / framework blocks.** Richer per-stage result emission (e.g., parsing pytest output into structured test results, a JSON-emitter plugin) is deferred. The v3 contract emits only `exit_code`, timing, and object-storage URIs for stdio.
-- **Storage column shape changes.** v3 commits only to the data contracts (HCL source for pipeline and formula, the `exec_result` schema, the `pipeline_results` reshape). The precise ALTER TABLE statements — what tables hold the records, what columns get added or reshaped, what existing tables retire — are the runtime RFD's concern.
+- **Storage column shape changes.** v3 commits only to the data contracts (HCL source for pipeline and formula, the `exec_result` schema, the `pipeline.<name>.scenarios` reshape). The precise ALTER TABLE statements — what tables hold the records, what columns get added or reshaped, what existing tables retire — are the runtime RFD's concern.
 
 ### Not retained from v1/v2 (full replacement)
 
@@ -145,11 +145,10 @@ locals {
 }
 
 component "q1" {
-  from      = "programming-q1"
   max_score = document.examination.questions["q1"].marks
   score     = sum([for code in local.test_codes :
                    document.examination.questions["q1"].marks / length(local.test_codes)
-                   if try(pipeline_results[code].test.exit_code, -1) == 0])
+                   if succeeded(pipeline["programming-q1"].scenarios[code].test)])
 }
 
 scoring {
@@ -183,7 +182,7 @@ pipeline "name" {
 }
 ```
 
-- The label (here, `"name"`) is the pipeline's identifier. Any non-empty string is allowed (referenced from formulas as `from = "name"`, which is a string attribute — no HCL identifier rules apply).
+- The label (here, `"name"`) is the pipeline's identifier. Any non-empty string is allowed; formulas reference the pipeline's results via the reserved top-level namespace `pipeline.<name>` (or `pipeline["<name>"]` when the label isn't a bare HCL identifier — e.g., contains dashes).
 - Multiple pipelines in one config are allowed and are the norm for examination cases.
 - Pipelines are independent: no shared state, no inter-pipeline `depends_on`, no cross-pipeline references in HCL. They execute in parallel at runtime.
 - A pipeline must contain at least one `stage` block (after dynamic expansion).
@@ -198,7 +197,7 @@ stage "name" {
 }
 ```
 
-- The label is the stage identifier. Must be unique within the pipeline. (Stage labels are not required to be HCL identifiers in v3 since they are referenced only as map keys in `pipeline_results`, never as bare names in expressions.)
+- The label is the stage identifier. Must be unique within the pipeline. (Stage labels are not required to be HCL identifiers in v3 since they are referenced only as map keys under `pipeline.<name>.scenarios[<code>]`, never as bare names in expressions.)
 - `depends_on` lists other stage names that must complete successfully before this stage runs. The default (when omitted) is the previous stage in declaration order — making the common linear case (`compile → execute → test`) implicit. **For the first stage in declaration order**, the implicit default is `depends_on = []` (no dependencies). Set `depends_on = []` explicitly to opt a non-first stage out of the implicit chain (useful for stages that should run in parallel with the first stage).
 - Stages run in topological order from the `depends_on` graph. Cycles are rejected at parse time.
 - **Success-gating semantics:** if any dependency stage ends in the `failed`, `error`, or `skipped` state, this stage's scenarios all receive `skipped: true` in their results and the stage's own state becomes `skipped`. (See [Result emission contract](#result-emission-contract).)
@@ -298,7 +297,7 @@ exec {
 A stage's scenarios are declared either statically (`scenario "code" { ... }`) or dynamically (`dynamic "scenario" { for_each = ... }`); they can be mixed.
 
 - Scenario codes must be unique within a stage. Codes must match `[a-zA-Z0-9_-]+` — letters, digits, hyphen, underscore. Dynamic-block-generated labels that don't match this pattern are validate-phase errors. (This is stricter than the HCL syntax for block labels and prevents brittle codes from URL-encoding, shell escaping, or path quirks downstream.)
-- The same code across different stages of the same pipeline refers to the same logical scenario — the formula's `pipeline_results.<code>` will have entries for each stage that declared it. (See [Result emission contract](#result-emission-contract).)
+- The same code across different stages of the same pipeline refers to the same logical scenario — the formula's `pipeline.<pipeline-name>.scenarios[<code>]` will have entries for each stage that declared it. (See [Result emission contract](#result-emission-contract).)
 - The code `"default"` is reserved for the implicit single-scenario case. Explicitly declaring `scenario "default" {}` is a parse error.
 - A stage with no `scenario` or `dynamic "scenario"` blocks at all gets one implicit scenario with code `"default"`.
 
@@ -494,16 +493,16 @@ The `succeeded`/`failed` pair is the formula's canonical predicate for "did this
 Typical formula patterns without `try()`:
 
 ```hcl
-# Count scenarios that passed the test stage
-score = length([for _, s in pipeline_results : 1 if succeeded(s.test)]) * 10
+# Count scenarios that passed the test stage of pipeline "main"
+score = length([for _, s in pipeline.main.scenarios : 1 if succeeded(s.test)]) * 10
 
-# Per-question marks from the exam, awarded only on success
-score = sum([for code, s in pipeline_results :
+# Per-question marks from the exam, awarded only on success — over the "mc" pipeline
+score = sum([for code, s in pipeline.mc.scenarios :
              document.examination.questions[code].marks
              if succeeded(s.test)])
 
-# All-or-nothing for a question with multiple test cases
-score = alltrue([for _, s in pipeline_results : succeeded(s.test)]) ? 30 : 0
+# All-or-nothing for a question with multiple test cases — pipeline name has a dash
+score = alltrue([for _, s in pipeline["programming-q1"].scenarios : succeeded(s.test)]) ? 30 : 0
 ```
 
 ## Result emission contract
@@ -579,52 +578,66 @@ URIs are opaque to the formula — it never parses them. The runtime RFD picks t
 - **`command`/`args` are resolved values**, not templates. Anything the runtime actually invoked.
 - **Per-scenario parameters are not stored.** The pipeline's scenario block may carry attributes (`args`, `timeout`, etc.); these drive execution and are captured in `command`/`args`/etc. — not as a separate metadata dict. Scoring-relevant per-scenario metadata belongs in the formula, not the pipeline.
 
-### Reshape for formula consumption
+### The `pipeline` namespace
 
-When the formula evaluates a component, the runtime reshapes its source pipeline's results into a `pipeline_results` map keyed by scenario code:
+Formulas access pipeline-run data through a reserved top-level namespace `pipeline`. For each pipeline declared in the paired pipeline config, the runtime injects an entry `pipeline.<name>` (or `pipeline["<name>"]` for non-identifier names) whose `scenarios` attribute is a scenario-keyed map.
 
 ```hcl
-pipeline_results = {
-  "default" = {
-    "compile" = { command, args, exit_code, ..., stdin_uri, stdout_uri, stderr_uri }
+pipeline = {
+  "main" = {
+    scenarios = {
+      "default" = {
+        "compile" = { command, args, exit_code, ..., stdin_uri, stdout_uri, stderr_uri }
+      }
+      "test1" = {
+        "execute" = { ... },
+        "test"    = { ... }
+      }
+      "test2" = { "execute" = { ... }, "test" = { ... } }
+      "test3" = { "execute" = { ... }, "test" = { ... } }
+    }
   }
-  "test1" = {
-    "execute" = { ... },
-    "test"    = { ... }
-  }
-  "test2" = {
-    "execute" = { ... },
-    "test"    = { ... }
-  }
-  "test3" = {
-    "execute" = { ... },
-    "test"    = { ... }
+  "programming-q2" = {
+    scenarios = { ... }
   }
 }
 ```
 
-#### `pipeline_results` schema
+The namespace is **reserved** (instructors can't declare their own `pipeline` value via `locals`) and **runtime-injected** (resolved once the pipeline runs complete, before formula evaluation begins). It sits alongside the other reserved namespaces in formula scope: `local.<name>` (author-declared), `document.<type>` (parse-phase-resolved), `pipeline.<name>` (runtime-resolved).
 
-This is the formula's contract with the pipeline. It is generated by the runtime from the `pipeline_run.results` JSONB and exposed as an HCL value to component `score` expressions.
+**Where `pipeline.<name>` is in scope.** Only inside expressions that evaluate against runtime data:
+
+- `component.score`
+- `scoring.total`
+
+`pipeline.<name>` is **not** in scope in expressions that resolve at parse phase: `locals { ... }`, `component.max_score`, `dynamic` block `for_each`, etc. Referencing it from those contexts is a parse-phase error.
+
+<a id="pipelinenamescenarios-schema"></a>
+#### `pipeline.<name>.scenarios` schema
+
+This is the formula's contract with the pipeline. The runtime generates each entry from the corresponding `pipeline_run.results` JSONB and exposes it as an HCL value to runtime-evaluated expressions.
 
 | Type | Description |
 |------|-------------|
-| `map(string, object)` | Outer map. Keys are scenario codes; values are nested per-stage maps. |
-| `pipeline_results[<code>]` | Type `map(string, object)`. Keys are stage names; values are the **exec_result fields** (`command`, `args`, `exit_code`, `timed_out`, `skipped`, `error`, `started_at`, `ended_at`, `duration_ms`, `stdin_uri`, `stdout_uri`, `stderr_uri`). |
-| `pipeline_results[<code>][<stage>]` | The flattened `result` object from the `exec_result` JSONB entry. Field types match the [Field definitions](#field-definitions) table verbatim. |
+| `pipeline.<name>` | Type `object` with at minimum a `scenarios` attribute. Future v3 versions may add metadata fields (e.g., `pipeline.<name>.run_id`, `pipeline.<name>.started_at`); the v3 surface commits only to `scenarios`. |
+| `pipeline.<name>.scenarios` | Type `map(string, object)`. Outer map keyed by scenario codes; values are nested per-stage maps. |
+| `pipeline.<name>.scenarios[<code>]` | Type `map(string, object)`. Keys are stage names; values are the **exec_result fields** (`command`, `args`, `exit_code`, `timed_out`, `skipped`, `error`, `started_at`, `ended_at`, `duration_ms`, `stdin_uri`, `stdout_uri`, `stderr_uri`). |
+| `pipeline.<name>.scenarios[<code>][<stage>]` | The flattened `result` object from the `exec_result` JSONB entry. Field types match the [Field definitions](#field-definitions) table verbatim. |
 
-**Missing-key semantics.** `pipeline_results[<code>]` is absent if no stage of the pipeline produced a scenario with that code. `pipeline_results[<code>][<stage>]` is absent if that scenario was not declared in that stage (the asymmetric case described below). Accessing an absent key in HCL is a parse-time evaluation error, caught by `try()` — formula authors use `try(sc.test.exit_code, -1) == 0` to defensively handle scenarios that don't have a `test` stage entry.
+**Missing-key semantics.** `pipeline.<name>.scenarios[<code>]` is absent if no stage of that pipeline produced a scenario with that code. `pipeline.<name>.scenarios[<code>][<stage>]` is absent if that scenario was not declared in that stage (the asymmetric case described below). Accessing an absent key in HCL is a parse-time evaluation error, caught by `try()` — or by the null-permissive `succeeded()` / `failed()` predicates which return `false` on absent arguments.
 
-**Heterogeneous keys.** Stages with different scenario sets produce heterogeneous outer keys. In the example above, `"default"` only has `"compile"` (because `compile` has no explicit scenarios, getting the implicit `"default"`), while `"test1"`/`"test2"`/`"test3"` have `"execute"` and `"test"` but not `"compile"`. **A formula iterating `for code, sc in pipeline_results` will visit the `"default"` key too** — the canonical pattern uses `try(sc.<stage>.exit_code, -1) == 0` so the iteration silently skips scenarios that lack the stage the formula cares about.
+**Heterogeneous keys.** Stages with different scenario sets produce heterogeneous outer keys. In the example above, `"default"` only has `"compile"` (because `compile` has no explicit scenarios, getting the implicit `"default"`), while `"test1"`/`"test2"`/`"test3"` have `"execute"` and `"test"` but not `"compile"`. **A formula iterating `for code, sc in pipeline.main.scenarios` will visit the `"default"` key too** — the canonical pattern uses `succeeded(sc.<stage>)` (null-permissive) so the iteration silently skips scenarios that lack the stage the formula cares about.
 
 **Two safe iteration patterns.** Use whichever fits the pipeline shape:
 
-- **Iterate `pipeline_results` directly** when every scenario in the pipeline has the stage you're checking. This is the natural shape for batched pipelines (e.g., the `mc` pipeline whose single `test` stage produces one scenario per question — every key in `pipeline_results` is a question id with a `test` entry).
-- **Iterate an explicit code list** (`for code in local.test_codes : ... pipeline_results[code].<stage>...`) when only a subset of the pipeline's scenarios are relevant — e.g., a coding pipeline where `compile` adds a `"default"` key the scoring should ignore. The explicit list filters out unwanted keys without `try()` boilerplate.
+- **Iterate `pipeline.<name>.scenarios` directly** when every scenario in the pipeline has the stage you're checking. This is the natural shape for batched pipelines (e.g., `pipeline.mc.scenarios` whose single `test` stage produces one scenario per question — every key is a question id with a `test` entry).
+- **Iterate an explicit code list** (`for code in local.test_codes : ... pipeline.<name>.scenarios[code].<stage>...`) when only a subset of the pipeline's scenarios are relevant — e.g., a coding pipeline where `compile` adds a `"default"` key the scoring should ignore. The explicit list filters out unwanted keys without `try()` boilerplate.
 
-**Empty pipelines.** If a pipeline produced zero results (e.g., the runtime failed to start the worker container at all), `pipeline_results` is an empty map (`{}`). Expressions like `length(pipeline_results) == 0` evaluate as expected; the formula author is expected to defend against this case with `try()` or explicit conditionals.
+**Empty pipelines.** If a pipeline produced zero results (e.g., the runtime failed to start the worker container at all), `pipeline.<name>.scenarios` is an empty map (`{}`). Expressions like `length(pipeline.<name>.scenarios) == 0` evaluate as expected; the formula author is expected to defend against this case with `try()` or explicit conditionals.
 
-**Runtime-error pipelines.** A pipeline whose worker crashed mid-execution (some scenarios completed, others didn't get a result emitted) produces a `pipeline_results` containing only the scenarios that *did* complete. The formula's evaluation proceeds against the partial map; defensive `try()` wrapping ensures missing scenarios produce predictable fallback values rather than uncaught evaluation errors. How the runtime distinguishes "partial because crash" from "partial because skipped" — and whether that distinction is surfaced to the formula beyond the per-scenario `skipped` flag — is the runtime RFD's call.
+**Runtime-error pipelines.** A pipeline whose worker crashed mid-execution (some scenarios completed, others didn't get a result emitted) produces a `pipeline.<name>.scenarios` containing only the scenarios that *did* complete. The formula's evaluation proceeds against the partial map; defensive `try()` wrapping (or null-permissive `succeeded()` / `failed()`) ensures missing scenarios produce predictable fallback values rather than uncaught evaluation errors. How the runtime distinguishes "partial because crash" from "partial because skipped" — and whether that distinction is surfaced to the formula beyond the per-scenario `skipped` flag — is the runtime RFD's call.
+
+**Cross-pipeline composition.** Because `pipeline.<name>` is a top-level reserved namespace (not scoped per component), a single `component.score` expression may reference multiple pipelines — for instance, a bonus component that awards extra marks only when *both* coding-question pipelines pass all tests. Components remain independent of *each other* (one component's score cannot read another's), but they are not artificially scoped to a single source pipeline.
 
 ## Formula language
 
@@ -640,30 +653,53 @@ A formula config is one HCL file containing:
 
 The formula and pipeline files declare `locals` and `document` independently — they are separate HCL documents stored in separate database rows.
 
+Three reserved namespaces are available inside the file's expressions, each with distinct resolution semantics:
+
+| Namespace | Source | When resolved | Available in |
+|---|---|---|---|
+| `local.<name>` | Author-declared in `locals { ... }` | Parse phase | Everywhere |
+| `document.<type>` | Block-declared via `document "<type>" {}`; fetched from the examination service | Parse phase | Everywhere |
+| `pipeline.<name>` | Reserved; populated by the runtime from the paired pipeline config's `pipeline "<name>" { ... }` blocks | Runtime (after pipeline runs complete) | Only inside `component.score` and `scoring.total` |
+
+Authors cannot declare a `pipeline` value via `locals` (the name is reserved) and cannot reference `pipeline.<name>` from parse-phase contexts (`max_score`, `dynamic` block `for_each`, etc.) — those references are parse-phase errors. See [The `pipeline` namespace](#the-pipeline-namespace).
+
 ### Component block
 
 ```hcl
 component "correctness" {
-  from      = "main"
   max_score = 70
   weight    = 0.7
-  score     = sum([for code, sc in pipeline_results :
-                   10 if sc.test.exit_code == 0])
+  score     = sum([for code, sc in pipeline.main.scenarios :
+                   10 if succeeded(sc.test)])
 }
 ```
 
 **Required attributes:**
-- `from` — name of the pipeline whose results this component aggregates. Validated against the paired pipeline config at the parse phase (see [Validation](#validation)).
 - `max_score` — number, **must be positive**. Both the UI's "out of X" denominator and a hard cap on `score`.
-- `score` — HCL expression yielding a number. Has `pipeline_results`, `document.*`, `local.*`, and all supported functions in scope.
+- `score` — HCL expression yielding a number. Has `pipeline.<name>`, `document.*`, `local.*`, and all supported functions in scope.
 
 **Optional attributes:**
 - `weight` — number, **must be positive**, default 1. Free-form metadata accessible in `scoring.total` as `<component_name>.weight`. UI may surface it in rubric displays.
 - `min_score` — number, default 0. Floor on the resolved `score`. Set to a negative number to allow a deduction-style component (e.g., a "style penalty" component whose `score` expression yields negative values for accumulated issues).
 
-**`pipeline_results` is scoped per component.** Each component's `score` expression sees only the results of the pipeline named in `from` — `pipeline_results` is *not* a global map across all pipelines. This means scenario codes can collide across pipelines without conflict (e.g., both `programming-q1` and `programming-q2` can have a scenario `"test1"`). The runtime builds a fresh `pipeline_results` map per component by selecting the source pipeline's run record and reshaping its `exec_result` array.
+**No `from` attribute.** Components do not declare a source pipeline. Each `pipeline.<name>` reference inside the `score` expression *is* the dependency declaration — the runtime statically scans the expression for `pipeline.<name>` / `pipeline["<name>"]` references and validates each against the paired pipeline config at the parse phase. This is symmetric with how `document.examination.questions[...]` references are validated: the reference itself is the declaration.
 
-**Component cross-references.** Components are **not** in scope inside other components' `score` expressions — each component evaluates independently against its own `pipeline_results`. Cross-component arithmetic (e.g., "this component depends on whether the style component passed") must happen in `scoring.total`, where every component's score is in scope by name. This keeps component evaluation order irrelevant and makes the dependency surface explicit.
+**Scenario codes can collide across pipelines without conflict.** Because the namespace is `pipeline.<name>.scenarios[<code>]`, two pipelines can each have a scenario `"test1"` — `pipeline.q1.scenarios["test1"]` and `pipeline.q2.scenarios["test1"]` are distinct values.
+
+**Cross-pipeline composition is allowed.** A single component's `score` expression may reference multiple pipelines:
+
+```hcl
+# Bonus component awarded only if both coding-question pipelines pass all tests
+component "coding_bonus" {
+  max_score = 10
+  score     = (
+    alltrue([for _, s in pipeline["programming-q1"].scenarios : succeeded(s.test)]) &&
+    alltrue([for _, s in pipeline["programming-q2"].scenarios : succeeded(s.test)])
+  ) ? 10 : 0
+}
+```
+
+**Component cross-references.** Components are **not** in scope inside other components' `score` expressions — each component evaluates independently against `pipeline.*` data. Cross-component arithmetic (e.g., "this component depends on whether the style component passed") must happen in `scoring.total`, where every component's score is in scope by name. This keeps component evaluation order irrelevant and makes the dependency surface explicit.
 
 **Clamping:** the resolved `score` is clamped to `[min_score, max_score]` (default `[0, max_score]`). Overshooting in either direction (e.g., the expression yields 80 against `max_score = 70`) is recorded in the breakdown as a warning so the instructor can spot expression bugs.
 
@@ -676,16 +712,15 @@ dynamic "component" {
   for_each = [for q in document.examination.questions : q if q.type == "coding"]
   labels   = ["q-${component.value.id}"]
   content {
-    from      = "programming-${component.value.id}"
     max_score = component.value.marks
-    score     = sum([for code, sc in pipeline_results :
-                     component.value.marks / length(pipeline_results)
-                     if try(sc.test.exit_code, -1) == 0])
+    score     = sum([for code, sc in pipeline["programming-${component.value.id}"].scenarios :
+                     component.value.marks / length(pipeline["programming-${component.value.id}"].scenarios)
+                     if succeeded(sc.test)])
   }
 }
 ```
 
-Standard HCL2 dynamic block. Expanded at the parse phase. The generated component names from `labels` must be unique with respect to all other (static and dynamic) component names.
+Standard HCL2 dynamic block. Expanded at the parse phase. The generated component names from `labels` must be unique with respect to all other (static and dynamic) component names. The pipeline reference inside the expanded `score` expression — `pipeline["programming-${component.value.id}"]` — interpolates per-iteration; each generated component depends on the pipeline name derived from its iterator value, and parse-phase validation runs against each expanded reference.
 
 ### Scoring block
 
@@ -719,18 +754,16 @@ locals {
 }
 
 component "correctness" {
-  from      = "main"
   max_score = sum([for k, v in local.scenario_marks : v])
-  score     = sum([for code, sc in pipeline_results :
+  score     = sum([for code, sc in pipeline.main.scenarios :
                    local.scenario_marks[code]
-                   if try(sc.test.exit_code, -1) == 0])
+                   if succeeded(sc.test)])
 }
 
 component "style" {
-  from      = "main"
   max_score = 20
   weight    = 0.3
-  score     = try(pipeline_results["default"].lint.exit_code, -1) == 0 ? 20 : 0
+  score     = succeeded(pipeline.main.scenarios["default"].lint) ? 20 : 0
 }
 
 scoring {
@@ -751,21 +784,19 @@ dynamic "component" {
   for_each = [for q in document.examination.questions : q if q.type == "coding"]
   labels   = ["q-${component.value.id}"]
   content {
-    from      = "programming-${component.value.id}"
     max_score = component.value.marks
-    score     = sum([for code, sc in pipeline_results :
-                     component.value.marks / length(pipeline_results)
-                     if try(sc.test.exit_code, -1) == 0])
+    score     = sum([for code, sc in pipeline["programming-${component.value.id}"].scenarios :
+                     component.value.marks / length(pipeline["programming-${component.value.id}"].scenarios)
+                     if succeeded(sc.test)])
   }
 }
 
 # One component covering all MC questions in the batched mc pipeline
 component "mc_batch" {
-  from      = "mc"
   max_score = sum([for q in document.examination.questions : q.marks if q.type == "mc"])
-  score     = sum([for code, sc in pipeline_results :
+  score     = sum([for code, sc in pipeline.mc.scenarios :
                    document.examination.questions[code].marks
-                   if try(sc.test.exit_code, -1) == 0])
+                   if succeeded(sc.test)])
 }
 
 scoring {
@@ -803,7 +834,8 @@ Caught with HCL diagnostics including source line/column. Single-file checks, no
 - Forward reference within a `locals` block.
 - Visibility filter with `effect` other than `"hide"`/`"none"`, `selector` containing an undefined value, `when`/`until` containing an undefined condition.
 - `total` expression in scoring referencing an undefined component name.
-- Required attribute missing on `component` (`from`, `max_score`, `score`) or `scoring` (`max_score`).
+- Required attribute missing on `component` (`max_score`, `score`) or `scoring` (`max_score`).
+- A `pipeline.<name>` or `pipeline["<name>"]` reference appearing inside a parse-phase context (`locals { ... }`, `component.max_score`, `dynamic` block `for_each`, etc.) where only parse-resolved values are available.
 - A scenario code (static label or dynamic `labels` result) not matching `[a-zA-Z0-9_-]+`.
 - A `dynamic` block missing both `for_each` and `content`.
 - Function calls to functions outside the supported set.
@@ -825,12 +857,12 @@ These produce parser warnings rather than errors. The config still validates, bu
 
 Caught at grading workflow start, before any dispatch. Failures here fail the run with a structured error that surfaces to the instructor:
 
-- `from = "..."` on a component referencing a pipeline name not present in the paired pipeline config.
+- A `pipeline.<name>` or `pipeline["<name>"]` reference inside a `component.score` or `scoring.total` expression that does not resolve to a pipeline declared in the paired pipeline config. Each such reference in the formula is statically scanned for; expansion of `dynamic "component"` blocks may produce additional references, which are validated post-expansion.
 - `document "examination" { id = X }` declared in both pipeline and formula configs with different `id` values.
 - A `document` block reference (`document.examination.questions["q1"]`) to a question id that does not exist in the resolved examination.
 - A `document` block reference to a field not in the committed contract for that document type (e.g., `document.examination.questions["q1"].marks` from a *pipeline* — `marks` is only in scope in the formula contract).
 - Dynamic expansion produces zero stages or zero components after resolving `for_each` (the pipeline / formula would have nothing to execute or score).
-- `pipeline.run.results` from a prior run referenced indirectly through `pipeline_results` whose shape doesn't match the contract (defensive — should never happen but flagged for observability).
+- A `pipeline_run.results` from a prior run reshaped into `pipeline.<name>.scenarios` whose shape doesn't match the contract (defensive — should never happen but flagged for observability).
 
 ### Runtime evaluation errors (during formula evaluation)
 
@@ -849,7 +881,7 @@ v3 commits to two things about where its inputs live; everything else about pers
 - **Pipeline HCL source persists as bytes** in the existing `pipeline.config` row. Parsed on read; the parsed form may be cached but is not authoritative.
 - **Formula HCL source persists as bytes** in the existing `evaluation.formula` row, analogously. The previous `components` and `scoring` JSONB columns are replaced by an HCL source column; the exact column-shape change is the runtime RFD's responsibility.
 
-The runtime RFD additionally owns: how `exec_result` records get from worker to database, what tables hold them, what existing tables (`pipeline.result`, `evaluation.score.items`, etc.) get retired by the new flow, how multiple pipeline runs per submission get joined for formula evaluation, and what columns get added or reshaped. v3 commits only to the data contracts described in [Result emission contract](#result-emission-contract) and the [pipeline_results schema](#pipeline_results-schema); the runtime RFD picks the storage shape that serves them.
+The runtime RFD additionally owns: how `exec_result` records get from worker to database, what tables hold them, what existing tables (`pipeline.result`, `evaluation.score.items`, etc.) get retired by the new flow, how multiple pipeline runs per submission get joined for formula evaluation, and what columns get added or reshaped. v3 commits only to the data contracts described in [Result emission contract](#result-emission-contract) and the [`pipeline.<name>.scenarios` schema](#pipelinenamescenarios-schema); the runtime RFD picks the storage shape that serves them.
 
 ## Abandoned ideas
 
@@ -889,6 +921,24 @@ Considered requiring scenario codes to be unique *across all stages and pipeline
 ### Inline assertion DSL on `exec`
 
 A common alternative — particularly in unified-exec HCL designs elsewhere — is to support `assert { exit_code = 0 }` on exec blocks and inline `test { stdin = "..." assert { stdout = "..." } }` blocks for scored test cases. v3 explicitly rejects these because they mix execution and testing in one stage. Instead, v3 forces testing into its own stage: a `diff` exec (or any other comparator) whose exit code feeds the formula. This is more verbose for trivial cases but keeps the semantics crisp: the pipeline never expresses a "pass/fail" judgement, only "what ran and what it produced."
+
+### `from = "..."` attribute on `component`
+
+An earlier draft of the formula language gave each `component` block a `from = "<pipeline-name>"` attribute that declared which pipeline the component aggregated, and exposed the bound results via a bare `pipeline_results` variable. Discarded for three reasons:
+
+- The bare `pipeline_results` had no syntactic affordance for "this is runtime-injected" — instructors couldn't tell from the name alone that it wasn't a local they'd forgotten to declare. The other reserved namespaces in v3 (`local.<name>`, `document.<type>`) all use a dotted prefix; `pipeline_results` was the outlier.
+- The `from = "..."` attribute duplicated information that the `score` expression already encoded. A reader (or a static analyzer) could derive the dependency by scanning the expression; declaring it separately invited drift.
+- Per-component scoping of pipeline data — a property the `from` attribute enabled — turned out not to be load-bearing. It avoided scenario-code collisions across pipelines, but a top-level `pipeline.<name>.scenarios[<code>]` namespace avoids collisions equally well by namespacing under the pipeline name. And it forbade cross-pipeline composition inside a single component (e.g., bonus marks awarded only when *both* coding questions pass), which has legitimate uses.
+
+The top-level `pipeline.<name>` namespace replaces both the attribute and the bare variable. The attribute is gone; the variable is gone; the dependency is implicit in the expression and validated at parse phase.
+
+### `pipeline "<name>" {}` sub-block on `component`
+
+Considered making the source declaration a sub-block (`pipeline "<name>" {}` inside `component`) instead of an attribute, with a `pipeline.<...>` namespace introduced by that block. This was the cleanest path to symmetry with `document "examination" { id = 1 }` → `document.examination.<...>`. Rejected because the block-introduces-namespace pattern, applied to a sub-block of `component`, would still scope `pipeline.<...>` to that component's declared source — preserving the per-component scoping limitation that the top-level namespace approach drops. A top-level reserved namespace (no declaration block at all) is both more symmetric (matches `local.<name>` and `document.<type>`, neither of which are declared inside `component`) and more flexible (cross-pipeline composition is natural).
+
+### Naming variants: `result.scenarios`, `source.scenarios`, etc.
+
+Considered keeping the `from` attribute but renaming the runtime variable to `result.scenarios` or `source.scenarios` (matching a renamed attribute). Rejected because both options keep the `from`/data redundancy and don't match the `<reserved-namespace>.<name>.<...>` shape of `document.<type>.<...>`. `pipeline.<name>.scenarios[<code>]` is parallel to `document.examination.questions["q1"]` — the same dotted "namespace dot name dot member" shape — which is the strongest mental-model anchor v3 has.
 
 ## Out of scope
 
