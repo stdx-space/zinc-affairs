@@ -431,9 +431,9 @@ pipeline "<qid>" {
 }
 
 component "<qid>" {
-  from      = "<qid>"
   max_score = document.examination.questions["<qid>"].marks
-  score     = # ...instructor-authored score expression...
+  score     = # ...instructor-authored score expression that references
+              #    pipeline["<qid>"].scenarios[<code>].<stage>...
 }
 ```
 
@@ -445,6 +445,14 @@ equal partial credit vs weighted per-test-case marks vs penalty for
 timeouts — and none of these can be mechanically derived from question
 metadata. Putting the component in the fragment keeps the per-question
 grading definition in one place, in one editor.
+
+The fragment **does not** include the `pipeline "<qid>" {}` declaration
+block that the formula file requires to ground the `pipeline.<qid>`
+namespace (per RFD 0013). That declaration is auto-emitted by the
+generator into the assembled formula — one per coding question, plus
+one per non-coding modality the document uses. The instructor never
+writes it; the lint shell injects it so live diagnostics stay
+truthful (see [Linting](#linting)).
 
 ### Lifecycle
 
@@ -499,28 +507,30 @@ pipeline "<qid>" {
 }
 
 component "<qid>" {
-  from      = "<qid>"
   max_score = document.examination.questions["<qid>"].marks
   # All-or-nothing default over the declared test cases.
   # Replace ["test1"] with the full list of scenario codes if you
   # add more scenarios; or rewrite for partial-credit semantics.
+  # Bracket-indexed access on `pipeline` is used because question IDs
+  # may contain dashes — `pipeline.<qid>` only works for bare HCL
+  # identifiers.
   score = alltrue([for code in ["test1"] :
-                   try(succeeded(pipeline_results[code].test), false)])
+                   succeeded(pipeline["<qid>"].scenarios[code].test)])
             ? document.examination.questions["<qid>"].marks
             : 0
 }
 ```
 
 **Iteration over an explicit scenario-code list, not over
-`pipeline_results` directly.** RFD 0013 documents that
-`pipeline_results` has heterogeneous keys — e.g., the `compile` stage
-contributes a `"default"` scenario that has no `test` entry. A naive
-`for _, s in pipeline_results : succeeded(s.test)` returns `false`
-for the `"default"` entry (since `s.test` is null and `succeeded(null)`
-is `false`), so `alltrue` always returns `false` even when every real
-test case passes. The template uses an explicit list to avoid this
-trap; the comment tells the instructor where to extend it as they add
-scenarios.
+`pipeline["<qid>"].scenarios` directly.** RFD 0013 documents that
+`pipeline.<name>.scenarios` has heterogeneous keys — e.g., the
+`compile` stage contributes a `"default"` scenario that has no `test`
+entry. A naive `for _, s in pipeline["<qid>"].scenarios :
+succeeded(s.test)` returns `false` for the `"default"` entry (since
+`s.test` is null and `succeeded(null)` is `false`), so `alltrue`
+always returns `false` even when every real test case passes. The
+template uses an explicit list to avoid this trap; the comment tells
+the instructor where to extend it as they add scenarios.
 
 ### Editorial surface
 
@@ -608,6 +618,11 @@ two blocks:
   pipeline config.
 - The `component "<qid>" { ... }` block is appended to the assembled
   formula config.
+- A `pipeline "<qid>" {}` declaration block (per RFD 0013) is
+  auto-emitted into the assembled formula config to ground the
+  `pipeline.<qid>` namespace the component references. The instructor
+  doesn't write this declaration; it follows mechanically from the
+  existence of the coding question.
 - Any `locals` declared in the fragment are merged into the assembled
   file's top-level `locals` (see [Locals across coding
   fragments](#locals-across-coding-fragments)).
@@ -643,27 +658,32 @@ the same shape, differing only in the question id. Per-question
 expected answers live in the pre-materialized `*.expected` files (see
 [Derived assets](#derived-assets)).
 
-A corresponding formula component, also generated:
+A corresponding formula component, also generated. The formula file
+also gets a `pipeline "mc" {}` declaration at top level to ground the
+namespace this component references:
 
 ```hcl
+pipeline "mc" {}
+
 component "mc" {
-  from      = "mc"
   max_score = sum([for q in document.examination.questions : q.marks if q.type == "mc"])
-  score     = sum([for code, s in pipeline_results :
+  score     = sum([for code, s in pipeline.mc.scenarios :
                    document.examination.questions[code].marks
                    if succeeded(s.test)])
 }
 ```
 
 Per-question marks are awarded on `diff` success. Because every key
-in `pipeline_results` for this pipeline is a question id (the dynamic
-block emitted exactly one scenario per MC question, no implicit
-`"default"`), the iteration is safe — no heterogeneous-key
-defensiveness needed for the batched non-coding pipelines.
+in `pipeline.mc.scenarios` is a question id (the dynamic block emitted
+exactly one scenario per MC question, no implicit `"default"`), the
+iteration is safe — no heterogeneous-key defensiveness needed for the
+batched non-coding pipelines.
 
 **TF questions.** Structurally identical to MC — one batched pipeline
-`"tf"` with the same dynamic-scenario shape, one component `"tf"` with
-the same per-question marks scoring expression.
+`"tf"` with the same dynamic-scenario shape, one `pipeline "tf" {}`
+declaration in the formula, and one component `"tf"` whose `score`
+expression iterates `pipeline.tf.scenarios` with the same per-question
+marks logic.
 
 **SA questions.** One batched pipeline `"sa"`. Because `match_options`
 vary per question, the generator emits **static scenarios** rather than
@@ -692,8 +712,9 @@ pipeline "sa" {
 }
 ```
 
-The component is the same shape as MC's. Per-question marks awarded on
-`diff` success.
+The component is the same shape as MC's (with `pipeline.sa.scenarios`
+iteration); the formula also receives a `pipeline "sa" {}` declaration
+at top level. Per-question marks awarded on `diff` success.
 
 **Essay questions.** Not emitted in the pipeline. The default
 scoring-policy `max_score` filters them out
@@ -734,6 +755,16 @@ document "examination" { id = <doc_id> }
 locals {
   # Same merged locals as the pipeline file.
 }
+
+# Pipeline declarations grounding the `pipeline.<name>` namespaces
+# referenced below. One per non-coding modality present in the
+# document, plus one per coding question. Emitted in the same stable
+# order as the pipeline file's declarations.
+pipeline "mc" {}
+pipeline "tf" {}
+pipeline "sa" {}
+pipeline "q1" {}
+pipeline "q5" {}
 
 # Generated components per non-coding modality.
 component "mc" { ... }
@@ -901,7 +932,12 @@ contract — including `marks`-field access), the lint flow synthesizes
    any fragment-locals merged in, and the fragment's `pipeline` block.
 4. **Formula lint shell:** a temporary v3 *formula* config — same
    header but with the formula-scope `document` contract (includes
-   `marks`), and the fragment's `component` block.
+   `marks`), an injected `pipeline "<qid>" {}` declaration so the
+   component's `pipeline.<qid>` reference grounds against RFD 0013's
+   declaration requirement, and the fragment's `component` block. The
+   injection mirrors what the generator does at materialization time;
+   the lint shell is the same composition the runtime would parse,
+   minus the other questions' contributions.
 5. RFD 0013's **validate-phase** rules run against each shell
    independently. Diagnostics are merged, with line/column positions
    mapped back to the fragment's coordinates so error markers point
