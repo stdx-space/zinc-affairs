@@ -181,18 +181,36 @@ applied at read time.
 
 | Modality | Blob shape |
 |---|---|
-| `mc`     | `{ "correct_choice": "B", "marks": 5 }` — `correct_choice` must be a key of the question's `MultipleChoiceInfo.choices`. |
-| `tf`     | `{ "answer": true, "marks": 3 }` |
-| `sa`     | `{ "expected": "...", "match_options": { ... }, "marks": 5 }` |
-| `essay`  | `{ "rubric_html": "<p>...</p>", "marks": 10 }` — `rubric_html` is displayed to human graders; not auto-graded in v3. |
-| `coding` | `{ "marks": 30, "grading_hcl": "pipeline \"q1\" {...}\ncomponent \"q1\" {...}" }` |
+| `mc`     | `{ "marks": 5, "correct_choice": "B" }` — `correct_choice` must be a key of the question's `MultipleChoiceInfo.choices`. |
+| `tf`     | `{ "marks": 3, "answer": true }` |
+| `sa`     | `{ "marks": 5, "expected": "...", "accept": ["..."]?, "match_options": { ... }? }` |
+| `essay`  | `{ "marks": 10, "rubric_typst": "..."?, "reference": "..."? }` |
+| `coding` | `{ "marks": 30, "grading_hcl": "pipeline \"q1\" {...}\ncomponent \"q1\" {...}", "reference": "..."? }` |
 
-**Marks are always per-question totals.** Coding questions do not carry
-per-test-case marks in the marking scheme; if an instructor wants
-differentiated per-case marks, those live in their authored fragment
-(typically as `locals { case_marks = {...} }` in the formula component's
+Fields marked `?` are optional.
+
+**`marks` always per-question total.** Coding questions do not carry
+per-test-case marks; differentiated per-case marks live in the authored
+fragment (typically `locals { case_marks = {...} }` in the component's
 score expression — see [Locals across coding
 fragments](#locals-across-coding-fragments)).
+
+**`accept` (SA, optional)** — a list of additional acceptable answers
+beyond `expected` (synonyms, equivalent forms). **Stored but not yet
+honored in v1**: the v1 SA comparator matches only `expected` (see [SA
+match options](#sa-match-options)). The field round-trips faithfully so
+no re-authoring is needed when the multi-answer comparator ships; a
+save-time warning fires when it is non-empty (see [Save-time
+validation](#save-time-validation-structural)).
+
+**`reference` (essay + coding, optional)** — a worked solution / model
+answer in Typst, preserved for human graders. Never read by the
+pipeline; purely documentation. (The document-import flow captures it
+from solution papers — see [Examination-import
+integration](#examination-import-integration).)
+
+**`rubric_typst` (essay, optional)** — grading guidance in Typst for
+human graders. Essays are not auto-graded in v3.
 
 ### Exposure through `document.examination`
 
@@ -235,6 +253,18 @@ The Documents-tab marking UI surfaces these as checkboxes per SA
 question. **No regex matching, no fuzzy matching, no edit-distance
 threshold.** If those become necessary the question must be promoted to
 a coding question or wait for a follow-up RFD.
+
+`match_options` subsumes the earlier `case_insensitive` boolean
+convention — `case_insensitive: true` is now `match_options.ignore_case`.
+
+**Multi-answer matching (`accept`) is deferred.** The v1 SA comparator
+is a single `diff` of the student answer against `expected`'s
+materialized file. A non-empty `accept` list cannot be expressed by one
+`diff` against one file — it requires a set-membership comparator
+(match against `expected` ∪ `accept`) that v1 does not build. The
+`accept` field is therefore stored and round-tripped but not honored in
+v1; the comparator is follow-up work. The save-time warning keeps this
+from being a silent mis-grade.
 
 ### Storage
 
@@ -452,7 +482,7 @@ Because modality is immutable, the lifecycle is simple:
 
 | Event | Effect on `grading_hcl` |
 |---|---|
-| Question created with `type = "coding"` | `grading_hcl` initialised with the no-op placeholder (see below) as part of the initial marking-scheme version. The instructor replaces this via the "Load language template" action in the inline HCL drawer. |
+| Question created with `type = "coding"` | `grading_hcl` initialised with the no-op placeholder (see below). The authoring layer (document-import agent, or instructor via the "Load language template" action) replaces it with a language-correct skeleton once the language is known. |
 | Question's marking scheme edited (HCL change) | New marking-scheme version contains the new HCL. |
 | Question deleted | Marking scheme cascades through `marking_scheme_meta`'s FK to the question. |
 
@@ -502,14 +532,49 @@ wrong-language stub. Rationale for the scores-zero default and for
 preferring the picker over a hardcoded template lives in [Abandoned
 alternatives](#c-todo-template-as-the-default-coding-fragment).
 
+### Coding skeleton: responsibility model
+
+The no-op default is deliberately language-blind because, at the moment
+a coding question is created, its language is not yet known — the
+language arrives later, in the answer-modality's `CodingModalityInfo`,
+not at question creation. The language-correct grading skeleton is
+therefore produced by the **authoring layer**, never the backend:
+
+| Layer | Responsibility |
+|---|---|
+| **Backend** (`create question type=coding`) | Seeds `grading_hcl` with the no-op placeholder. Always. Never language-aware. |
+| **Authoring layer** (document-import agent, or instructor via the picker) | Replaces the no-op with a language-correct skeleton, keyed off the now-known `CodingModalityInfo.language` and `compilation_enabled`. Sourced from the operational template library. |
+| **Instructor** | Fills the skeleton's placeholder test case with real inputs / expected outputs and adjusts scoring. |
+
+The backend stays dumb; the skeleton is an authoring-layer concern. This
+keeps the no-op default and the operational template library (below)
+consistent — neither needs the backend to understand languages.
+
+**Skeleton shape.** A loaded language template is a working
+compile→execute→test pipeline plus its component:
+
+- A **compile** stage only when `CodingModalityInfo.compilation_enabled`
+  is true (e.g., `g++` for C++, `javac` for Java; omitted for Python).
+- An **execute** stage invoking the language runtime / built binary.
+- A **test** stage with **one placeholder scenario** (a `diff` against a
+  TODO expected file) the instructor extends to the real cases.
+- A `component` scoring all-or-nothing over the declared cases (the
+  instructor rewrites for partial credit).
+
+The skeleton differs from the no-op in that it is language-correct and
+materializes a runnable (if not-yet-meaningful) grading flow; it still
+needs the instructor to supply real test data.
+
 ### Load-language-template picker
 
 A "Load language template" action in the [coding-question editorial
 surface](#coding-question-editorial-surface) replaces the no-op
-`grading_hcl` with one of a supported language template (Python,
-Java, C++, Go, etc.). The set of templates and their content is an
-operational artifact — versioned and updated outside this RFD; the
-RFD commits only to the action's existence.
+`grading_hcl` with the skeleton for `CodingModalityInfo.language`. Since
+the language is already set on the question, the picker does not ask the
+instructor to choose one — it applies (or re-applies) the skeleton for
+the known language. The set of templates and their content is an
+operational artifact — versioned and updated outside this RFD; the RFD
+commits only to the action's existence and the skeleton shape above.
 
 ### Coding-question editorial surface
 
@@ -835,8 +900,8 @@ Coding questions appear in the bulk view too, but only their `marks`
 field is editable inline. The `grading_hcl` field is too large for a
 table cell; the row links back to the question card's HCL drawer.
 
-Essay questions appear with their `marks` editable and a "rubric
-text" expand-on-click cell.
+Essay questions appear with their `marks` editable and an
+expand-on-click cell for `rubric_typst` / `reference`.
 
 The bulk view is reachable from a "Set marking scheme" action on the
 Documents tab header. The per-card fields remain available for
@@ -864,6 +929,69 @@ The vestigial "Save Scores" control is **deleted**. Auto-generation
 runs on every save; there is no separate "commit scores" action to
 expose. Reusing the v2 control would suggest semantics that no longer
 apply.
+
+## Examination-import integration
+
+The platform already has a document-import path: an MCP server exposes
+the examination mutation API as agent tools, and an `/import-exam`
+workflow drives them to author a full exam document — questions,
+descriptions, answer modalities, marking schemes, contexts — from a
+question paper (and optional solution paper). That path predates this
+RFD and authored marking schemes under an ad-hoc `solution_data`
+convention. This RFD's marking-scheme schema is **authoritative**; the
+import path must produce that schema. This section is the design for
+that reconciliation — the concrete tool/instruction edits are follow-on
+work, not specified here.
+
+### What the import agent must produce
+
+The agent authors each question's marking scheme in the [v3
+per-modality shape](#per-modality-blob-shape). Three changes from the
+pre-RFD convention:
+
+- **`marks`.** The pre-RFD convention carried no marks. Marks are now a
+  required field on every marking scheme. Papers commonly state marks
+  per question (`[5 marks]`, a mark column in a rubric table); the agent
+  ingests those into `marks`. When the paper gives no marks for a
+  question, the agent authors a placeholder (e.g., `marks: 0`) and flags
+  it low-confidence for the instructor to set — the same
+  flag-for-review pattern the import workflow already uses for missing
+  answer keys.
+- **Field names and shapes.** `correct` → `correct_choice` (MC) /
+  `answer` (TF); `case_insensitive` → `match_options.ignore_case` (SA);
+  the alternative-answers list maps to `accept` (SA). The agent's model
+  answers for essay/coding map to `reference` (Typst), and essay grading
+  guidance to `rubric_typst`.
+- **Coding `grading_hcl`.** The pre-RFD convention left coding marking
+  schemes empty (`{}` or a bare `reference`). Under this RFD a coding
+  marking scheme carries `grading_hcl`. Because the agent sets the
+  question's `CodingModalityInfo.language` during import, it knows the
+  language at authoring time and **authors the language-correct skeleton**
+  (per [Skeleton shape](#coding-skeleton-responsibility-model)) into
+  `grading_hcl` instead of leaving the no-op default in place. Real test
+  inputs/outputs the paper specifies are folded in where available;
+  otherwise the skeleton's placeholder case is flagged for the
+  instructor. The worked solution, if present, is preserved in
+  `reference`.
+
+### Why the agent, not the backend
+
+The skeleton is the authoring layer's job (per the [responsibility
+model](#coding-skeleton-responsibility-model)). The import agent is an
+authoring-layer actor: it already sets the language and parses the
+paper, so it is positioned to author the skeleton in the same pass.
+The backend's contract is unchanged — it seeds the no-op at question
+creation and validates whatever the agent writes against the v3 schema.
+
+### Affected surfaces (design intent only)
+
+The reconciliation touches the MCP server's authoring instructions and
+the `/import-exam` workflow's modality-shape guidance: both must teach
+the v3 marking-scheme shapes, marks ingestion, and coding-skeleton
+authoring. Enumerating the exact instruction edits is implementation
+work outside this RFD; the design commitment here is that the import
+path targets the v3 schema and authors coding skeletons rather than
+empty marking schemes.
 
 ## Persistence and linting
 
@@ -976,6 +1104,11 @@ Single-record checks; no cross-record resolution required.
 - For MC: `correct_choice` is a key of the question's
   `MultipleChoiceInfo.choices`.
 - For SA: `match_options` keys are within the defined set.
+- **Warning (non-fatal):** for SA, a non-empty `accept` list emits a
+  save-time warning — alternatives are stored but only `expected` is
+  matched in v1 (see [SA match options](#sa-match-options)). The save
+  succeeds; the warning surfaces in the authoring UI so the gap is
+  visible before exam day.
 - For coding: `grading_hcl` is non-empty and contains exactly one
   `pipeline "<qid>"` block and one `component "<qid>"` block where
   `<qid>` matches the question's id, and the fragment passes the
@@ -1042,10 +1175,14 @@ Items this RFD identifies but does not solve:
   generate` endpoint are dropped wholesale. Any operational tooling
   that consumes them needs migration; this RFD does not enumerate
   the surface.
-- **Per-modality option growth.** SA matching is constrained to
-  `diff`-translatable flags by design. A future RFD can broaden the
-  matcher set if there's demonstrated demand — likely by introducing
-  a comparator-stage shape that runs something other than `diff`.
+- **SA multi-answer comparator (`accept`).** The marking scheme stores
+  an `accept` list of alternative answers, but v1's single-`diff`
+  comparator honors only `expected`. A set-membership comparator
+  (match against `expected` ∪ `accept`, under `match_options`) is
+  deferred — it needs a comparator-stage shape that runs something
+  other than a one-target `diff`. Until it ships, `accept` is stored,
+  round-tripped, and flagged at save time but not graded against. Any
+  broader matcher growth (regex, fuzzy) rides the same follow-up.
 - **Concurrent save / grading-run ordering.** The save-blocks-grading
   property is committed to here; the mechanics (advisory locks, queue
   ordering, retry policy) are the runtime RFD's responsibility.
