@@ -33,6 +33,23 @@ require per-question authoring (build commands, test stdin/stdout
 expectations, language toolchains, marking criteria) that is not
 mechanically derivable from question metadata alone.
 
+## Decisions at a glance
+
+The whole design in one table; each row links to its detail section.
+
+| Area | Decision |
+|---|---|
+| [Position](#proposal-position-c-with-a-coding-escape-hatch) | Document is the source of truth; pipeline + formula configs are derived, never hand-edited for non-coding modalities. |
+| [Coding escape hatch](#coding-question-authoring) | Each coding question owns one HCL fragment (`pipeline` + `component`) stored in its marking-scheme blob. The only HCL surface. |
+| [Cardinality](#cardinality) | activity ↔ document ↔ config is 1:1:1. No shared/reused configs. |
+| [Versioning](#materialization-timing) | Configs mutate in place — no history, no per-run config snapshot. |
+| [Marking scheme](#marking-scheme-schema) | Typed per-modality blob carries marks + answer key + (coding) `grading_hcl`. `accept` stored-not-honored in v1; `reference`/`rubric_typst` are human-facing. |
+| [Coding skeleton](#coding-skeleton-responsibility-model) | Backend seeds a no-op; the authoring layer (import agent / picker) writes the language skeleton from `CodingModalityInfo`. Backend never language-aware. |
+| [Scoring policy](#scoring-policy) | Per-exam HCL on the document; structured-form UI with a raw-HCL advanced mode. |
+| [Materialization](#materialization-timing) | Generator runs eagerly on save; the config column is authoritative (no re-materialize at grading-run). |
+| [Linting](#linting) | Coding fragment lints against two synthesized shells (pipeline-scope + formula-scope). |
+| [Import integration](#examination-import-integration) | The document-import path targets this schema and authors coding skeletons (design only here). |
+
 ## Background
 
 The legacy v2 system had a "Generate from document" button (the now-deleted
@@ -73,48 +90,34 @@ executable end-to-end for non-coding modalities.
 
 ### Out of scope (deferred to follow-up RFDs)
 
-- **Manual grading of essay questions.** Essays remain in the document
-  and carry marks, but are not auto-graded in v3 and have no pipeline
-  emitted for them. A separate RFD covers the manual-scoring surface
-  — but note that adding a `component "essay"` block later is a
-  **future breaking change** to existing configs (see [Open
+- **Manual grading of essay questions.** Essays carry marks but aren't
+  auto-graded in v3; a separate RFD covers manual scoring. Adding a
+  `component "essay"` later is a **future breaking change** (see [Open
   follow-ups](#open-follow-ups)).
-- **Re-grading mechanics.** This RFD describes the data model
-  implications of regeneration but not the execution flow (which is
-  the runtime RFD's concern).
-- **The v2 generator code path.** v2 is being replaced wholesale; this
-  RFD does not propose a migration. Existing v2 configs are rewritten
-  by hand against the v3 contract.
-- **Multi-language coding-question authoring.** The
-  `CodingModalityInfo` blob is unchanged by this RFD. Per-language
-  build/test conventions live in the instructor's authored fragment.
-- **Language-template library content.** RFD 0014 commits to the
-  existence of a "Load language template" picker in the inline HCL
-  drawer (see [Load-language-template picker](#load-language-template-picker)),
-  but the actual library — which languages are supported, what each
-  template contains, how templates version and update — is an
-  operational concern handled outside the RFD process. Templates can
-  be added, removed, or revised without bumping this RFD.
-- **Class-bound (reusable across activities) configs.** v2 allowed one
-  config to be attached to many activities. v3 makes this impossible
-  by design (see [Cardinality](#cardinality)).
-- **Modality changes after question creation.** A question's modality
-  is immutable once set — confirmed by the current `UpdateQuestionDTO`
-  surface, which exposes only `display_name` and `tag_ids`. This RFD
-  does not propose changing that. Instructors who picked the wrong
-  modality delete the question and create a new one.
+- **Re-grading mechanics.** Data-model implications are here; the
+  execution flow is the runtime RFD's concern.
+- **The v2 generator code path.** Replaced wholesale; existing v2
+  configs are rewritten by hand, not migrated.
+- **Multi-language coding-question authoring.** `CodingModalityInfo` is
+  unchanged; per-language conventions live in the authored fragment.
+- **Language-template library content.** The RFD commits to the picker's
+  existence and the skeleton shape; the per-language template content is
+  operational (versioned outside the RFD).
+- **Class-bound configs.** v2's one-config-many-activities is dropped by
+  design (see [Cardinality](#cardinality)).
+- **Modality changes after creation.** Modality is immutable (the
+  current `UpdateQuestionDTO` exposes only `display_name`/`tag_ids`);
+  wrong-modality means delete and recreate.
 
 ### Not retained from v2
 
-- The destructive "Regenerate" button and its "any manual edits will
-  be lost" warning. There is no equivalent action.
-- The "Save Scores" control on the Documents tab. The Documents tab UI
-  is redesigned for the new model; reusing the v2 button would
-  miscommunicate the new semantics.
-- The `examination pipeline generate` endpoint as a one-shot
-  destructive operation. Auto-generation now runs on save.
-- One-config-many-activities attachment. See
-  [Cardinality](#cardinality).
+- The destructive "Regenerate" button + its "edits will be lost"
+  warning — no equivalent action.
+- The "Save Scores" control — the Documents tab is redesigned; the v2
+  button would miscommunicate the new semantics.
+- The one-shot `examination pipeline generate` endpoint — generation
+  now runs on save.
+- One-config-many-activities attachment (see [Cardinality](#cardinality)).
 
 ## Proposal: Position C with a coding-escape-hatch
 
@@ -126,7 +129,7 @@ per-question authored HCL fragment that owns the grading logic the
 platform cannot mechanically infer, stored inside the coding question's
 marking-scheme blob.
 
-The five organising decisions:
+The organising decisions:
 
 1. **The document drives the config.** Non-coding questions (MC, TF, SA) are mechanically translated to pipeline + formula HCL by the generator. The `pipeline.config` row is derived materialized state, not authoring input. Per-question rubric data lives in the marking-scheme blob; exam-wide scoring policy lives on the document; the assembled config is a pure function of these inputs.
 2. **Coding questions are the only escape hatch.** Each coding question owns one HCL fragment — both its `pipeline "<qid>" {...}` block (the grading DAG) and its `component "<qid>" {...}` block (the score expression) — stored inside the coding question's marking-scheme blob. No other modality has an HCL surface.
@@ -214,27 +217,23 @@ human graders. Essays are not auto-graded in v3.
 
 ### Exposure through `document.examination`
 
-Under the relaxed RFD 0013 contract, the marking-scheme blob fields
-flow into the document namespace under `marking.<...>` per question.
-Both pipeline-scope and formula-scope see everything except `marks` —
-that field is formula-only by design (the pipeline doesn't make
-scoring decisions). The mapping from blob field to namespace:
+Under the relaxed RFD 0013 contract, blob fields flow into the document
+namespace as `marking.<...>` per question. Both scopes see everything
+except `marks`, which is formula-only by design (the pipeline doesn't
+make scoring decisions):
 
-| Modality | `marking.<...>` fields exposed | Pipeline scope | Formula scope |
+| Modality | `marking.<...>` exposed | Pipeline | Formula |
 |---|---|---|---|
-| `mc`     | `expected_file` (path string materialized by the generator from `correct_choice`) | ✓ | ✓ + `marks` |
-| `tf`     | `expected_file` (path materialized from `answer`) | ✓ | ✓ + `marks` |
-| `sa`     | `expected_file` (from `expected`); `diff_flags` (list of strings translated from `match_options`) | ✓ | ✓ + `marks` |
-| `essay`  | none (not auto-graded) | n/a | only `marks` |
-| `coding` | none (instructor-authored fragment is the rubric) | n/a | only `marks` |
+| `mc`     | `expected_file` (from `correct_choice`) | ✓ | ✓ + `marks` |
+| `tf`     | `expected_file` (from `answer`) | ✓ | ✓ + `marks` |
+| `sa`     | `expected_file` (from `expected`); `diff_flags` (from `match_options`) | ✓ | ✓ + `marks` |
+| `essay`  | none (not auto-graded) | n/a | `marks` |
+| `coding` | none (fragment is the rubric) | n/a | `marks` |
 
-The raw blob fields (`correct_choice`, `answer`, `expected`,
-`match_options`) are translated by the generator into the
-`marking.expected_file` path and `marking.diff_flags` list at
-materialization time, so the pipeline reads ready-to-use values rather
-than re-interpreting marking-scheme semantics. This keeps the pipeline
-HCL agnostic to the marking-scheme schema's exact field names — only
-the generator knows the translation.
+The generator translates the raw blob fields into the `expected_file`
+path and `diff_flags` list at materialization, so the pipeline reads
+ready-to-use values and stays agnostic to the marking-scheme's field
+names — only the generator knows the translation.
 
 ### SA match options
 
@@ -278,30 +277,19 @@ on the next grading run.
 
 ### Derived assets
 
-For non-coding modalities, the generator materializes the
-expected-answer content into a file the assembled pipeline's `diff`
-calls compare against. The path is chosen by the generator (or
-runtime — exact layout is a runtime concern) and exposed to the
-pipeline through `document.examination.questions[<id>].marking.expected_file`,
-per RFD 0013's contract relaxation. The marking data the pipeline
-reads is the path the generator wrote — no hardcoded path convention
-authors or runtime code depend on.
+For non-coding modalities the generator materializes the expected
+answer into a plain-text file the pipeline's `diff` compares against —
+MC the `correct_choice` string, TF the boolean as the student submits
+it (`"true"`/`"false"`), SA the `expected` string verbatim. The path is
+generator/runtime-chosen and exposed via `marking.expected_file`, so
+there's no hardcoded path convention to depend on (see [Abandoned
+alternatives](#abandoned-alternatives)).
 
-Per-modality content of the expected-answer file:
-
-- MC: the `correct_choice` string (e.g., `"B"`).
-- TF: the boolean rendered as the same string the student submits (per modality convention — `"true"` / `"false"`).
-- SA: the `expected` string verbatim.
-
-These files are derived: any change to the marking scheme that affects
-non-coding expected answers triggers a re-materialization of the
-relevant files before the next save returns. The materialization step
-also re-publishes the `marking.expected_file` path into the document's
-synthetic view used at parse phase. Asset-write semantics (idempotency,
-ordering, atomicity across questions, exact path scheme) are the
-runtime RFD's concern; this RFD commits only to the data dependency
-and the contract that the pipeline reads paths from the document, not
-from convention.
+These files are derived: a marking-scheme change re-materializes the
+affected files (and re-publishes the path into the document's synthetic
+view) before the save returns. Asset-write semantics — idempotency,
+atomicity, the exact path scheme — are the runtime RFD's concern; this
+RFD commits only to the data dependency.
 
 ### Question-ID constraint
 
@@ -346,74 +334,36 @@ Two modes, with one canonical storage (`scoring_policy_hcl`).
 
 **Structured mode (default).** A small form:
 
-- **Max score:** radio buttons — "Auto (sum of question marks
-  excluding essays)" / "Fixed value: [____]". The "Auto" option
-  **displays its current resolved value** next to the radio (e.g.,
-  *"Auto (currently: 87)"*) so the instructor can sanity-check what
-  the denominator actually is without opening the assembled-config
-  preview.
-- **Min score:** numeric input (default `0`).
-- **Total scoring rule:** dropdown with **two** options —
-  - *Sum of all component scores* (default; generator emits no
-    `total` attribute so RFD 0013's default-sum behaviour applies).
-  - *Weighted sum* (UI reveals a per-component weight input table;
-    generator emits
-    `total = sum([for n, c in component : c.score * c.weight])` and
-    writes each component's `weight = ...` into the generated
-    components).
+- **Max score:** "Auto (sum of non-essay marks)" / "Fixed value". Auto
+  shows its current resolved value (e.g. *"Auto (currently: 87)"*) so
+  the denominator is verifiable without opening the config preview.
+- **Min score:** numeric, default `0`.
+- **Total scoring rule:** a **two-option** dropdown — *Sum of component
+  scores* (default; generator emits no `total`, RFD 0013's default-sum
+  applies) or *Weighted sum* (reveals a per-component weight table;
+  generator emits `total = sum([for n, c in component : c.score *
+  c.weight])` and writes `weight` onto each component, relying on RFD
+  0013's default `weight = 1`). No "Custom expression" option — custom
+  logic lives behind the Advanced toggle (see [Abandoned
+  alternatives](#abandoned-alternatives)).
+- **Weight table** (weighted-sum only) uses human-readable labels
+  ("Multiple choice (all questions)", "Question N: <display_name>"),
+  mapped back to component names internally — the instructor never sees
+  raw identifiers.
 
-  The weighted-sum option relies on RFD 0013's default `weight = 1`
-  for any component that doesn't declare one — the generated
-  non-coding components don't carry a `weight` attribute, and the
-  default-1 makes the sum behave as expected.
+**Advanced mode.** A raw HCL editor for the whole scoring-block body;
+content becomes `scoring_policy_hcl` verbatim. Home for penalty rules,
+bonus caps, and other custom logic. (Whole-block toggle, not per-field —
+see [Abandoned alternatives](#abandoned-alternatives).)
 
-  **There is no "Custom expression" option in the dropdown.** Custom
-  scoring expressions are reachable only via the explicit
-  Advanced-mode toggle below — keeping the dropdown HCL-free
-  prevents a non-technical instructor from stumbling into an HCL
-  editor by accident.
-- **Per-component weights (weighted-sum only):** when weighted-sum
-  is selected, the form reveals a table of *human-readable* component
-  labels with weight inputs:
-  - "Multiple choice (all questions)" — for `component "mc"`
-  - "True/False (all questions)" — for `component "tf"`
-  - "Short answer (all questions)" — for `component "sa"`
-  - "Question N: <display_name>" — one row per coding question
-    `component "<qid>"`
-  The UI maps these labels back to component names internally; the
-  instructor never sees raw HCL identifiers like `mc` or `q1`.
-
-The form's outputs translate into the HCL text on save.
-
-**Advanced mode.** A full HCL editor for the entire scoring-block
-body. The user edits raw HCL; the editor's content becomes
-`scoring_policy_hcl` verbatim. This is where instructors needing
-penalty rules, bonus-question handling, or other custom logic land.
-
-**Mode detection on load.** When the Scoring view opens, the stored
-HCL is parsed against the form-recognizable patterns:
-
-- If it matches one of the structured patterns → render structured
-  mode editable.
-- If it doesn't match → render structured mode **read-only with a
-  banner**, but **also display the resolved values in plain
-  language**: *"Pass mark: 60% of 100. Max score: 100 (computed from
-  custom expression). Min score: 0."* The instructor who can't read
-  HCL can still see what the policy resolves to, so they can verify
-  it's not catastrophically wrong before exam day.
-
-The exam overview / activity card carries a small
-"Scoring: custom (Advanced)" indicator when the scoring policy is in
-this state, so a non-technical instructor learns about the lockout
-*before* they sit down to verify the pass mark.
-
-Switching from Advanced back to Structured warns: "Reset to a
-structured rule? Your custom expression will be lost."
-
-**Field-level HCL toggles are not provided.** A whole-block toggle
-(structured vs Advanced) is the only escape; per-field toggles
-fragment the surface and confuse the "which fields can I write
-expressions in" mental model.
+**Mode detection on load.** The stored HCL is matched against the
+structured patterns: a match renders the editable form; a non-match
+renders the form **read-only with a banner** that still **shows the
+resolved values in plain language** (*"Pass mark: 60% of 100…"*) so a
+non-HCL instructor can sanity-check it. The exam overview carries a
+"Scoring: custom (Advanced)" indicator so the lockout is visible before
+they open the tab. Switching Advanced → Structured warns that the
+custom expression will be lost.
 
 ## Coding-question authoring
 
@@ -423,24 +373,13 @@ A coding question's authored grading fragment is stored as the
 `grading_hcl` field inside the coding question's **marking-scheme
 blob**. There is no separate column on `examination.question`.
 
-This placement has two properties that matter:
-
-- **Instructor-only by API design.** Marking schemes are never delivered
-  to students. The grading HCL — which contains test cases, expected
-  outputs, and the full grading DAG — inherits that access posture
-  automatically. No per-endpoint filtering required.
-- **Versioned per question.** Editing the HCL bumps only this
-  question's marking-scheme version, not the modality blob, not
-  other questions' schemes.
-
-The coding marking-scheme blob shape:
-
-```json
-{
-  "marks": 30,
-  "grading_hcl": "pipeline \"q1\" {\n  ...\n}\n\ncomponent \"q1\" {\n  ...\n}"
-}
-```
+Two properties make the marking scheme the right home: it's
+**instructor-only by API design** (never delivered to students, so the
+test cases / expected outputs / DAG in the HCL inherit that access
+posture with no per-endpoint filtering), and it's **versioned per
+question** (editing the HCL bumps only this question's marking-scheme
+version). The blob shape is `{ marks, grading_hcl, reference? }` (see
+the [per-modality table](#per-modality-blob-shape)).
 
 ### The fragment shape
 
@@ -490,46 +429,26 @@ No archive column, no modality-flip handling, no soft-delete state.
 
 ### Default no-op placeholder
 
-The default `grading_hcl` populated when a coding question is created
-is a **no-op** — a pipeline that runs cleanly and a component that
-scores zero. The real starting point comes from the
-[Load-language-template picker](#load-language-template-picker) the
-instructor uses next:
+The `grading_hcl` seeded at coding-question creation is a **no-op**: a
+single `stage "placeholder" { exec { command = "true" } }` pipeline and
+a `component` that scores `0`.
 
 ```hcl
 pipeline "<qid>" {
-  description = "<question's display name>"
-
-  # Placeholder pipeline. Use the "Load language template" action in
-  # the inline HCL drawer to populate a working starting point for
-  # your chosen language (Python, Java, C++, Go, etc.); then
-  # customize. Until then, this stage runs cleanly and the component
-  # below scores 0.
-  stage "placeholder" {
-    exec {
-      command = "true"
-    }
-  }
+  stage "placeholder" { exec { command = "true" } }
 }
-
 component "<qid>" {
   max_score = document.examination.questions["<qid>"].marks
-  # Placeholder: scores 0 until the pipeline is configured. The
-  # conservative default ensures an unconfigured coding question never
-  # accidentally awards full marks; the instructor sees an obvious
-  # "this question always scores 0" signal during testing and replaces
-  # this expression when authoring real grading logic.
-  score = 0
+  score     = 0
 }
 ```
 
-The default is chosen so the freshly created question materializes
-cleanly without committing to a language: the placeholder pipeline
-runs and exits 0, no references to files that don't yet exist, no
-guessed compiler invocation. The instructor's first real edit comes
-from the Load-language-template picker rather than from deleting a
-wrong-language stub. Rationale for the scores-zero default and for
-preferring the picker over a hardcoded template lives in [Abandoned
+It materializes and runs cleanly without committing to a language (no
+missing-file references, no guessed compiler), and scores zero rather
+than full marks so an un-configured question fails visibly rather than
+silently awarding credit. The authoring layer replaces it with a
+language skeleton (next); why a no-op rather than a hardcoded template
+is in [Abandoned
 alternatives](#c-todo-template-as-the-default-coding-fragment).
 
 ### Coding skeleton: responsibility model
@@ -561,10 +480,6 @@ compile→execute→test pipeline plus its component:
 - A `component` scoring all-or-nothing over the declared cases (the
   instructor rewrites for partial credit).
 
-The skeleton differs from the no-op in that it is language-correct and
-materializes a runnable (if not-yet-meaningful) grading flow; it still
-needs the instructor to supply real test data.
-
 ### Load-language-template picker
 
 A "Load language template" action in the [coding-question editorial
@@ -580,7 +495,7 @@ commits only to the action's existence and the skeleton shape above.
 
 Coding-question HCL is edited inline on the Documents tab, per coding
 question. (The Grading tab carries no whole-config editor; that path
-is intentionally closed — see [Abandoned alternatives](#pure-hcl-escape-hatch-with-no-structural-lockdown).)
+is intentionally closed — see [Abandoned alternatives](#abandoned-alternatives).)
 
 Mechanics:
 
@@ -589,29 +504,16 @@ Mechanics:
 - Clicking it opens a drawer or modal overlay anchored to the question
   card, sized for 30–80-line HCL pipelines rather than card height.
 - The drawer contains a single HCL editor (Monaco-based or equivalent)
-  with live diagnostics from the lint endpoint
-  ([Linting](#linting)).
-- A **"Load language template"** action appears prominently in the
-  drawer chrome when the current `grading_hcl` is the no-op placeholder
-  (and remains available, with an overwrite warning, after the
-  fragment has been customized). The picker lists the supported
-  language templates (Python, Java, C++, Go, ...); selecting one
-  replaces the editor content with that template. The template
-  library is operational — what languages exist and what each
-  template contains is not pinned in this RFD.
-- Save commits the new HCL into a fresh marking-scheme version for
-  the question.
+  with live diagnostics from the lint endpoint ([Linting](#linting)),
+  and surfaces the [Load-language-template
+  picker](#load-language-template-picker) prominently while the fragment
+  is still the no-op.
+- Save commits the new HCL into a fresh marking-scheme version.
 
-There is no whole-config editor on the Grading tab. The Grading tab
-exposes only:
-
-- The scoring policy authoring UI (see [Scoring policy](#scoring-policy)).
-- An **Advanced** subsection containing a "View assembled config"
-  action that opens a **strictly read-only** preview of the stitched
-  HCL — useful for debugging a failed grading run, not for editing.
-  Demoted from a primary action because non-technical instructors who
-  open it reflexively see HCL and lose trust. Any write path through
-  this preview is a conflict-surface liability and is not provided.
+There is no whole-config editor on the Grading tab; it exposes only the
+[scoring-policy UI](#scoring-policy) and an Advanced "View assembled
+config" action — a strictly read-only preview for debugging failed runs
+(no write path; not a primary action).
 
 ### Locals across coding fragments
 
@@ -642,17 +544,9 @@ generate(document, [per-question marking schemes], scoring_policy_hcl)
   → (pipeline_config_hcl, formula_config_hcl)
 ```
 
-It runs **eagerly on save** of any input (document edit, marking-scheme
-update including coding HCL edit, scoring-policy save). The save is
-not considered complete until materialization succeeds. The result is
-written to the `pipeline.config.source` and `evaluation.formula.source`
-columns, **which are authoritative** — the runtime parses them as-is
-at grading-run start. No re-materialization at grading-run time.
-
-If a save is in flight when grading is requested, the grading
-dispatch waits for the save's transaction to commit (mechanics deferred
-to the runtime RFD). Re-materializing at grading-run start was
-considered and rejected — see [Abandoned alternatives](#re-materialization-at-grading-run-time).
+It runs eagerly on every canonical-state save and its output is
+column-authoritative (timing detail in [Materialization
+timing](#materialization-timing)). This section is what it emits.
 
 ### Per-modality emission
 
@@ -673,170 +567,77 @@ two blocks:
   file's top-level `locals` (see [Locals across coding
   fragments](#locals-across-coding-fragments)).
 
-**MC questions.** One batched pipeline `"mc"`:
+**MC / TF / SA — one batched pipeline per modality.** All three emit
+the same shape: one `pipeline "<modality>"` with a single `test` stage
+whose `dynamic "scenario"` block produces one `diff` scenario per
+question of that modality, driving the expected-answer path (and, for
+SA, the diff flags) off `document.examination.questions[<id>].marking.<...>`.
+SA is the superset; MC/TF are identical minus `diff_flags`:
 
 ```hcl
-pipeline "mc" {
-  description = "Multiple-choice questions"
-
-  stage "test" {
-    visibility { filter { effect = "hide"; until = "collection_stop" } }
-    exec {
-      command    = "diff"
-      stdin_path = "/dev/null"
-      dynamic "scenario" {
-        for_each = [for q in document.examination.questions : q if q.type == "mc"]
-        labels   = [scenario.value.id]
-        content {
-          args = [
-            "${scenario.value.id}.txt",
-            scenario.value.marking.expected_file,
-          ]
-        }
-      }
-    }
-  }
-}
-```
-
-The dynamic block is uniform across MC questions — every scenario is
-the same shape, differing only in the question id. Per-question
-expected-answer paths come from `scenario.value.marking.expected_file`
-(see [Derived assets](#derived-assets)).
-
-A corresponding formula component, also generated. The formula file
-also gets a `pipeline "mc" {}` declaration at top level to ground the
-namespace this component references:
-
-```hcl
-pipeline "mc" {}
-
-component "mc" {
-  max_score = sum([for q in document.examination.questions : q.marks if q.type == "mc"])
-  score     = sum([for code, s in pipeline.mc.scenarios :
-                   document.examination.questions[code].marks
-                   if succeeded(s.test)])
-}
-```
-
-Per-question marks are awarded on `diff` success. Because every key
-in `pipeline.mc.scenarios` is a question id (the dynamic block emitted
-exactly one scenario per MC question, no implicit `"default"`), the
-iteration is safe — no heterogeneous-key defensiveness needed for the
-batched non-coding pipelines.
-
-**TF questions.** Structurally identical to MC — one batched pipeline
-`"tf"` with the same dynamic-scenario shape, one `pipeline "tf" {}`
-declaration in the formula, and one component `"tf"` whose `score`
-expression iterates `pipeline.tf.scenarios` with the same per-question
-marks logic.
-
-**SA questions.** One batched pipeline `"sa"`, symmetric with MC and TF.
-Per-question `match_options` (translated to `diff` flags) and the
-expected-answer file path both flow through `document.examination.questions[<id>].marking.<...>`
-under the relaxed RFD 0013 contract, so the generator can emit a
-uniform dynamic block rather than per-question static scenarios:
-
-```hcl
+# pipeline config — SA shown; MC/TF drop the diff_flags concat
 pipeline "sa" {
-  description = "Short-answer questions"
-
   stage "test" {
     visibility { filter { effect = "hide"; until = "collection_stop" } }
     exec {
       command    = "diff"
       stdin_path = "/dev/null"
-
       dynamic "scenario" {
         for_each = [for q in document.examination.questions : q if q.type == "sa"]
         labels   = [scenario.value.id]
         content {
-          args = concat(
-            scenario.value.marking.diff_flags,
-            [
-              "${scenario.value.id}.txt",
-              scenario.value.marking.expected_file,
-            ]
-          )
+          args = concat(scenario.value.marking.diff_flags, [   # MC/TF: no concat
+            "${scenario.value.id}.txt",
+            scenario.value.marking.expected_file,
+          ])
         }
       }
     }
   }
 }
+
+# formula — one declaration + one component per modality
+pipeline "sa" {}
+component "sa" {
+  max_score = sum([for q in document.examination.questions : q.marks if q.type == "sa"])
+  score     = sum([for code, s in pipeline.sa.scenarios :
+                   document.examination.questions[code].marks if succeeded(s.test)])
+}
 ```
 
-The generator translates each SA `match_options` blob into a
-`list(string)` of `diff` flags (mapping in [SA match
-options](#sa-match-options)) and publishes it as
-`scenario.value.marking.diff_flags`. The component is the same shape
-as MC's, against `pipeline.sa.scenarios`; the formula also gets a
-top-level `pipeline "sa" {}` declaration. Per-question marks awarded
-on `diff` success.
+`marking.diff_flags` is the generator's translation of the SA
+`match_options` blob (mapping in [SA match options](#sa-match-options));
+`marking.expected_file` is the materialized expected-answer path (see
+[Derived assets](#derived-assets)). Per-question marks are awarded on
+`diff` success. Iteration is safe without heterogeneous-key
+defensiveness: every key in a batched pipeline's `scenarios` is a
+question id with a `test` entry (no implicit `"default"`).
 
-**Essay questions.** Not emitted in the pipeline. The default
-scoring-policy `max_score` filters them out
-(`if q.type != "essay"`) — see [Scoring policy](#scoring-policy) and
-[Open follow-ups](#open-follow-ups) for the future-breaking-change
-implications of adding manual essay grading.
+**Essay questions.** Not emitted. The default scoring-policy `max_score`
+filters them out (`if q.type != "essay"`) — see [Open
+follow-ups](#open-follow-ups) for the future-breaking-change
+implications of manual essay grading.
 
 ### Full assembled-config shape
 
-```hcl
-version = 3
+Both files carry `version = 3`, the `document "examination"` block, and
+a merged top-level `locals` (generator locals — empty in v1 — plus any
+from coding fragments). Beyond that:
 
-document "examination" { id = <doc_id> }
+- **Pipeline config:** one generated `pipeline "<modality>"` per
+  non-coding modality present (stable order `mc`, `tf`, `sa`), then the
+  authored `pipeline "<qid>"` blocks spliced from each coding question's
+  `grading_hcl`, in question-declaration order.
+- **Formula config:** a `pipeline "<name>" {}` declaration for every
+  pipeline above (grounding the namespaces), the matching generated
+  `component "<modality>"` blocks and authored `component "<qid>"`
+  blocks, then a `scoring { ... }` wrapping `scoring_policy_hcl`
+  verbatim.
 
-locals {
-  # Generator-emitted locals (empty in v1) merged with any per-coding-fragment locals.
-}
-
-# One generated pipeline per non-coding modality present in the
-# document, in a stable order: mc, tf, sa.
-pipeline "mc" { ... }
-pipeline "tf" { ... }
-pipeline "sa" { ... }
-
-# Authored pipelines, one per coding question, in question
-# declaration order from the document.
-pipeline "q1" { ... }    # from coding question q1's grading_hcl
-pipeline "q5" { ... }    # from coding question q5's grading_hcl
-```
-
-And the formula:
-
-```hcl
-version = 3
-
-document "examination" { id = <doc_id> }
-
-locals {
-  # Same merged locals as the pipeline file.
-}
-
-# Pipeline declarations grounding the `pipeline.<name>` namespaces
-# referenced below. One per non-coding modality present in the
-# document, plus one per coding question. Emitted in the same stable
-# order as the pipeline file's declarations.
-pipeline "mc" {}
-pipeline "tf" {}
-pipeline "sa" {}
-pipeline "q1" {}
-pipeline "q5" {}
-
-# Generated components per non-coding modality.
-component "mc" { ... }
-component "tf" { ... }
-component "sa" { ... }
-
-# Authored components, one per coding question.
-component "q1" { ... }   # from coding question q1's grading_hcl
-component "q5" { ... }   # from coding question q5's grading_hcl
-
-# Scoring block — wraps the user's scoring_policy_hcl verbatim.
-scoring {
-  <scoring_policy_hcl contents>
-}
-```
+Ordering is identical across both files. Worked end-to-end examples of
+the v3 HCL live in RFD 0013's
+[`example-pipeline.hcl`](../0013/example-pipeline.hcl) and
+[`example-formula.hcl`](../0013/example-formula.hcl).
 
 ### Determinism
 
@@ -934,64 +735,37 @@ apply.
 
 The platform already has a document-import path: an MCP server exposes
 the examination mutation API as agent tools, and an `/import-exam`
-workflow drives them to author a full exam document — questions,
-descriptions, answer modalities, marking schemes, contexts — from a
-question paper (and optional solution paper). That path predates this
-RFD and authored marking schemes under an ad-hoc `solution_data`
-convention. This RFD's marking-scheme schema is **authoritative**; the
-import path must produce that schema. This section is the design for
-that reconciliation — the concrete tool/instruction edits are follow-on
-work, not specified here.
+workflow authors a full exam document from a question paper (plus
+optional solution paper). It predates this RFD and wrote marking schemes
+under an ad-hoc `solution_data` convention. This RFD's schema is
+**authoritative**; the import path must target it. Design only here —
+the concrete tool/instruction edits are follow-on.
 
-### What the import agent must produce
+**What the import agent must produce** — each marking scheme in the [v3
+shape](#per-modality-blob-shape), with three changes from the pre-RFD
+convention:
 
-The agent authors each question's marking scheme in the [v3
-per-modality shape](#per-modality-blob-shape). Three changes from the
-pre-RFD convention:
+- **`marks`** — now required. The agent lifts per-question marks the
+  paper states (`[5 marks]`, rubric columns) into `marks`; when absent,
+  it writes a placeholder and flags low-confidence (the same
+  flag-for-review pattern it uses for missing answer keys).
+- **Field shapes** — `correct` → `correct_choice`/`answer`;
+  `case_insensitive` → `match_options.ignore_case`; alternatives →
+  `accept`; model answers → `reference` (Typst); essay guidance →
+  `rubric_typst`.
+- **Coding `grading_hcl`** — the agent already sets
+  `CodingModalityInfo.language` during import, so it knows the language
+  and authors the language-correct [skeleton](#coding-skeleton-responsibility-model)
+  into `grading_hcl` rather than leaving the no-op. Paper-specified test
+  I/O is folded in where available; otherwise the placeholder case is
+  flagged. A worked solution is preserved in `reference`.
 
-- **`marks`.** The pre-RFD convention carried no marks. Marks are now a
-  required field on every marking scheme. Papers commonly state marks
-  per question (`[5 marks]`, a mark column in a rubric table); the agent
-  ingests those into `marks`. When the paper gives no marks for a
-  question, the agent authors a placeholder (e.g., `marks: 0`) and flags
-  it low-confidence for the instructor to set — the same
-  flag-for-review pattern the import workflow already uses for missing
-  answer keys.
-- **Field names and shapes.** `correct` → `correct_choice` (MC) /
-  `answer` (TF); `case_insensitive` → `match_options.ignore_case` (SA);
-  the alternative-answers list maps to `accept` (SA). The agent's model
-  answers for essay/coding map to `reference` (Typst), and essay grading
-  guidance to `rubric_typst`.
-- **Coding `grading_hcl`.** The pre-RFD convention left coding marking
-  schemes empty (`{}` or a bare `reference`). Under this RFD a coding
-  marking scheme carries `grading_hcl`. Because the agent sets the
-  question's `CodingModalityInfo.language` during import, it knows the
-  language at authoring time and **authors the language-correct skeleton**
-  (per [Skeleton shape](#coding-skeleton-responsibility-model)) into
-  `grading_hcl` instead of leaving the no-op default in place. Real test
-  inputs/outputs the paper specifies are folded in where available;
-  otherwise the skeleton's placeholder case is flagged for the
-  instructor. The worked solution, if present, is preserved in
-  `reference`.
-
-### Why the agent, not the backend
-
-The skeleton is the authoring layer's job (per the [responsibility
-model](#coding-skeleton-responsibility-model)). The import agent is an
-authoring-layer actor: it already sets the language and parses the
-paper, so it is positioned to author the skeleton in the same pass.
-The backend's contract is unchanged — it seeds the no-op at question
-creation and validates whatever the agent writes against the v3 schema.
-
-### Affected surfaces (design intent only)
-
-The reconciliation touches the MCP server's authoring instructions and
-the `/import-exam` workflow's modality-shape guidance: both must teach
-the v3 marking-scheme shapes, marks ingestion, and coding-skeleton
-authoring. Enumerating the exact instruction edits is implementation
-work outside this RFD; the design commitment here is that the import
-path targets the v3 schema and authors coding skeletons rather than
-empty marking schemes.
+This is the [responsibility model](#coding-skeleton-responsibility-model)
+in action: the import agent is an authoring-layer actor, so it owns the
+skeleton; the backend's contract is unchanged (seed no-op, validate
+against the v3 schema). The reconciliation lands in the MCP server's
+authoring instructions and the `/import-exam` modality-shape guidance —
+exact edits are implementation work.
 
 ## Persistence and linting
 
@@ -1007,11 +781,8 @@ empty marking schemes.
 | Derived expected-answer files | Examination asset paths (object storage) | Generator |
 
 Rows 1-3 are canonical; rows 4-6 are derived. Mutating a derived row
-directly (outside the generator) is an unsupported operation.
-
-**No new column on `examination.question`** — coding HCL lives in the
-question's marking-scheme blob, not as a separate field. No archive
-column, no `grading_hcl_archive`.
+directly (outside the generator) is unsupported. Coding HCL lives in
+the marking-scheme blob — no new column on `examination.question`.
 
 ### Materialization timing
 
@@ -1031,45 +802,27 @@ property.
 
 ### Linting
 
-The inline HCL drawer lints the coding fragment live as the
-instructor types. Because the fragment contains both a `pipeline`
-block (which must satisfy RFD 0013's pipeline-scope `document`
-contract) and a `component` block (which must satisfy the formula-scope
-contract — including `marks`-field access), the lint flow synthesizes
-**two shells**, one per scope:
+The inline drawer lints the fragment live. The fragment holds both a
+`pipeline` block (pipeline-scope `document` contract — no `marks`) and a
+`component` block (formula-scope contract — `marks` allowed), so the
+lint endpoint (`POST /v1/documents/{id}/marking-scheme/{question_id}/lint`)
+synthesizes **two shells** and runs RFD 0013's validate phase against
+each:
 
-1. The editor sends `(document_id, fragment_text)` to a lint endpoint
-   (`POST /v1/documents/{id}/marking-scheme/{question_id}/lint`).
-2. The server parses the fragment to extract its `pipeline` block,
-   `component` block, and any `locals` block.
-3. **Pipeline lint shell:** a temporary v3 *pipeline* config — `version
-   = 3`, generator's would-be locals (empty in v1), the
-   `document "examination" { id = N }` block (pipeline-scope contract),
-   any fragment-locals merged in, and the fragment's `pipeline` block.
-4. **Formula lint shell:** a temporary v3 *formula* config — same
-   header but with the formula-scope `document` contract (includes
-   `marks`), an injected `pipeline "<qid>" {}` declaration so the
-   component's `pipeline.<qid>` reference grounds against RFD 0013's
-   declaration requirement, and the fragment's `component` block. The
-   injection mirrors what the generator does at materialization time;
-   the lint shell is the same composition the runtime would parse,
-   minus the other questions' contributions.
-5. RFD 0013's **validate-phase** rules run against each shell
-   independently. Diagnostics are merged, with line/column positions
-   mapped back to the fragment's coordinates so error markers point
-   at the instructor's typing.
-6. **Parse-phase validation does not run here.** Cross-pipeline checks,
-   document-resolution checks, dynamic-block expansion against the real
-   document — these run at materialization time (eager on save) and
-   surface as save errors, not as live editor diagnostics.
+- **Pipeline shell** — `version = 3` + the `document "examination"`
+  block (pipeline scope) + merged fragment locals + the fragment's
+  `pipeline` block.
+- **Formula shell** — same header in formula scope + an injected
+  `pipeline "<qid>" {}` declaration (grounds the `pipeline.<qid>`
+  reference, mirroring what the generator emits) + the fragment's
+  `component` block.
 
-The validate-phase scope per shell is single-file: each catches its
-own typos, malformed blocks, missing required attributes, unsupported
-HCL functions, forward-reference errors in fragment-declared locals,
-etc. The split shell ensures that `marks` references in the `pipeline`
-block are caught as scope violations (pipeline-scope `document` doesn't
-expose `marks`), while the same reference in the `component` block is
-accepted.
+Diagnostics from both are merged with positions mapped back to the
+fragment's coordinates. The split is what lets a `marks` reference be
+rejected in the `pipeline` block but accepted in the `component` block.
+Parse-phase checks (cross-pipeline, document resolution, dynamic
+expansion) do **not** run here — they fire at materialization and
+surface as save errors, not live diagnostics.
 
 ### Re-grading
 
@@ -1189,163 +942,84 @@ Items this RFD identifies but does not solve:
 
 ## Abandoned alternatives
 
-The design space sketched in earlier drafts contained four positions
-on a single axis. Recording the unchosen options so the same paths
-aren't re-walked.
+Unchosen options, recorded so the same paths aren't re-walked. The
+first three (A/B/D) are the axis endpoints Position C was chosen
+against; the rest are narrower forks rejected during design.
 
-### Position A — manual HCL only
+**Position A — manual HCL only.** Document decoupled from configs;
+instructor types HCL. What RFD 0013 ships without 0014. Violates the
+premise (non-coding exams require HCL).
 
-The document is decoupled from configs; the platform offers templates
-and an editor; the instructor types HCL. This is what RFD 0013 ships
-without 0014. Rejected because it violates the premise (non-coding
-exams require HCL).
+**Position B — one-shot generation, no sync.** Generate a starter
+config, then HCL becomes the source of truth; document changes don't
+propagate, regeneration is destructive. This is v2's exact failure mode
+(regenerate-and-pray, silent drift).
 
-### Position B — one-shot generation, no sync
+**Position D — live binding only.** Instructor authors a thin HCL shell
+that delegates everything to `document.examination` references resolved
+at grading time. The authoring-surface problem remains — they still
+write *some* HCL per pipeline. Position C gets "document drives grading"
+with zero HCL for non-coding exams.
 
-The platform generates a starter config from the document; after
-generation, the HCL becomes the source of truth and subsequent
-document changes do not propagate. Re-running the generator is opt-in
-and destructive. Rejected because this is exactly v2's failure mode —
-the same "regenerate-and-pray" loop and silent-drift problems.
+**`grading_hcl` as a top-level `examination.question` column.** The
+question table is an identity table; per-modality grading data doesn't
+belong there, it needed a separate archive column for modality changes
+(unnecessary — modality is immutable), and the marking scheme already
+provides versioning + access control + an authoring path. The blob
+inherits all of that.
 
-### Position D — live binding via `document.examination` references only
+**`grading_hcl` inside `CodingModalityInfo`.** The modality blob is
+delivered to students for their editor; embedding test logic / expected
+outputs there is a leakage surface needing per-endpoint filtering. The
+marking scheme is instructor-only by API design.
 
-The HCL contains references like
-`document.examination.questions[code].marks` that the runtime resolves
-at grading time, and the instructor authors a thin HCL shell that
-delegates everything to the document. Rejected because the
-authoring-surface problem doesn't go away — instructors still have to
-write *some* HCL to declare pipelines, even if marks come from the
-document. Position C (this RFD) achieves the same "document drives
-grading" property without requiring any HCL for non-coding exams.
+**Pure HCL escape hatch, no lockdown.** A single editor over the whole
+stitched config, generated regions technically editable. Re-creates
+v2's destructive-regeneration problem; Position C's value is that
+generated regions are *not editable at all*.
 
-### `grading_hcl` as a top-level column on `examination.question`
+**Field-level HCL toggles in the scoring UI.** Per-field "use HCL"
+buttons fragment the surface — the instructor learns field-by-field
+which support HCL. One whole-block Advanced toggle gives the same power,
+one affordance.
 
-An earlier draft proposed adding a `grading_hcl TEXT` column directly
-to the question table. Rejected because: (a) the question table is an
-identity table; per-modality grading data doesn't belong there; (b) it
-required a separate `grading_hcl_archive` column to handle modality
-changes, which turned out to be unnecessary because modality is
-immutable; (c) marking schemes are already the canonical "how to grade
-this question" surface, with versioning, access control, and an
-authoring path already in place. Putting the HCL in the marking-scheme
-blob inherits all of those properties.
+**"Custom expression" as a scoring dropdown option.** A non-technical
+instructor could pick it and land in an HCL editor unwarned. Custom
+expressions live behind the explicit Advanced-mode toggle instead — a
+visible cross-mode boundary, not a hidden one inside a form control.
 
-### `grading_hcl` inside `CodingModalityInfo`
+**Per-test-case marks in the marking scheme.** `per_case: {...}` would
+force the marking scheme to know test-case codes the HCL author defines
+— coupling across layers meant to be independent. Per-case marks live
+in the fragment's `locals`, where the cases are declared.
 
-Considered putting the grading HCL inside the existing answer-modality
-blob alongside `language`, `template_code`, etc. Rejected because the
-modality blob is delivered to students for their editor view —
-embedding test-case logic and expected outputs there would require
-per-endpoint filtering and creates a leakage surface. The marking
-scheme is instructor-only by API design.
+**Class-bound configs (v2 reuse).** One config across many activities
+either can't read its activity's document or is bound to an arbitrary
+mismatched one — both re-introduce drift. 1:1:1 is the disciplined
+choice: to reuse, copy the document.
 
-### Pure HCL escape hatch with no structural lockdown
+**Re-materialization at grading-run time.** Running the generator again
+at run start "to catch drift" adds a write-race against concurrent saves
+for no gain — save-time materialization already covers canonical state
+and every edit re-triggers it. The column is authoritative.
 
-An earlier draft considered exposing a single HCL editor that showed
-the whole stitched config with generated regions visually distinguished
-but technically editable (the instructor could edit anywhere, accepting
-that auto-regeneration would clobber their edits). Rejected because
-it re-creates v2's destructive regeneration problem with extra steps;
-the value of Position C is that *the generated regions are not editable
-at all*.
+**Hardcoded `examination-assets/<modality>/<qid>.expected` path.** Once
+RFD 0013 exposes the path via `marking.expected_file`, the layout is a
+runtime detail, not a contract — the runtime can move/version/namespace
+files freely without an RFD change.
 
-### Field-level HCL toggles in the scoring UI
-
-Considered giving the scoring-policy form per-field "use HCL"
-buttons (e.g., `max_score` has its own HCL toggle independent of
-`total`). Rejected because the resulting surface is fragmented — the
-instructor has to learn that some fields support HCL and others don't,
-discoverable only by clicking each. A single whole-block toggle is
-one discoverable affordance for the same flexibility.
-
-### "Custom expression" as a scoring-rule dropdown option
-
-An earlier draft included "Custom expression" as a third option in
-the Total Scoring Rule dropdown, alongside "Sum" and "Weighted sum."
-Rejected because a non-technical instructor selecting it would be
-dropped into an HCL editor with no warning — the dropdown label
-sounds like a benign UI option, not an entry into a different
-authoring mode. Custom expressions are now reachable only via the
-explicit Advanced-mode toggle, which is a discoverable cross-mode
-boundary rather than a hidden one inside a form control.
-
-### Per-test-case marks in the marking scheme
-
-Considered carrying `per_case: { test1: 3, test2: 5, ... }` on coding
-marking-scheme entries. Rejected because the marking scheme would have
-to know about test-case codes the HCL author defines — a tight coupling
-across layers that were designed to be independent. Per-case marks
-belong in the instructor's authored fragment, where the test cases are
-declared, typically as a local map referenced by the component's score
-expression.
-
-### Class-bound configs (v2 reuse affordance)
-
-Considered preserving v2's ability to attach one config to multiple
-activities (or letting documents be reused across activities).
-Rejected because Position C's "document drives the config" property
-makes a class-bound config either (a) unable to read its activity's
-document, or (b) attached to an arbitrary document that may not match
-the activity's content. Both options re-introduce drift. The 1:1:1
-cardinality is the disciplined choice: to reuse, copy.
-
-### Re-materialization at grading-run time
-
-An earlier draft had the generator run *both* eagerly on save and
-again at grading-run start, on the theory that the second run would
-"catch drift." Rejected because save-time materialization already
-covers the canonical-state-at-save guarantee, any subsequent edit
-re-triggers materialization, and the second run adds a write-race
-surface against concurrent saves. The column is authoritative;
-grading reads it as-is.
-
-### Hardcoded `examination-assets/<modality>/<qid>.expected` path convention
-
-An earlier draft committed the generator (and the assembled pipeline
-HCL) to writing and reading expected-answer files at the literal
-filesystem path `examination-assets/<modality>/<qid>.expected`.
-Rejected after relaxing RFD 0013's pipeline-scope contract: the
-pipeline now reads the path via `document.examination.questions[<id>].marking.expected_file`,
-so the layout is a generator/runtime implementation detail rather than
-a contract. The runtime can move files, version them, namespace them
-per submission, or use object-storage URIs — none of which require an
-RFD update or a regenerated pipeline.
-
-### Static SA scenarios
-
-An earlier draft emitted SA grading as static `scenario "qN" {...}`
-blocks per question, with `diff_flags` inlined as HCL literals. This
-was a workaround for the stricter pre-relaxation pipeline-scope
-contract that didn't expose marking data. When RFD 0013 was relaxed
-to expose `marking.expected_file` and `marking.diff_flags` to the
-pipeline, the workaround dissolved — SA emits a uniform `dynamic
-"scenario"` block symmetric with MC and TF.
+**Static SA scenarios.** Emitting per-question `scenario` blocks with
+inlined `diff_flags` was a workaround for the pre-relaxation contract
+that hid marking data from the pipeline. With `marking.diff_flags` /
+`marking.expected_file` exposed, SA uses a uniform `dynamic "scenario"`
+block like MC/TF.
 
 <a id="c-todo-template-as-the-default-coding-fragment"></a>
-### C++ TODO template as the default coding fragment
-
-An earlier draft populated new coding-question `grading_hcl` with a
-hardcoded C++ compile/execute/test template containing TODO comments
-for the instructor to fill in. Rejected for three reasons:
-
-- **Language guess.** The template guessed C++; instructors writing
-  Python, Java, Go, or anything else had to rewrite most of it before
-  it worked. The guess was no help; it was a starting line the
-  instructor had to delete.
-- **Broken on materialization.** The template referenced files
-  (`<qid>.cpp`, `test1.expected`) that don't exist for a freshly
-  created question. The assembled config materialized cleanly but
-  failed at grading-time with confusing errors that traced back to
-  missing fixtures, not to "you haven't configured this question."
-- **No clean place for the right starting point.** Real per-language
-  scaffolding (Python's compile-step-skip, Java's package management,
-  Go's module setup, etc.) doesn't fit in one universal template.
-  The right shape is a library of language templates with a UI
-  picker — which is what we ship instead.
-
-The no-op default + language-template picker replaces the TODO
-template entirely. New coding questions get a fragment that
-materializes successfully, runs cleanly, and scores zero — making it
-obvious that real configuration is still needed, without producing
-crash-flavored errors during testing.
+**C++ TODO template as the coding default.** A hardcoded C++
+compile/execute/test stub was rejected because it guessed the language
+(wrong for most questions — a starting line to delete), referenced
+files that don't exist yet (materializes clean but fails at grading
+with confusing missing-fixture errors), and can't house real
+per-language scaffolding in one universal template. The no-op default +
+language-template picker replaces it: materializes cleanly, scores
+zero, signals "configure me" without crash-flavored errors.
