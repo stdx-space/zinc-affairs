@@ -373,6 +373,167 @@ Existing authorization checks are unchanged. `can_proctor` continues to inherit 
 13. **Force submit.** Invigilator sends `force_submit` for a specific student. Extension audits, sets `locked_at` (so the bearer `401`s at once), then publishes the single terminal subject `proctoring.session.revoked` with `action: submit_and_lock` on NATS; core (whose `examination` activity owns submit semantics) submit-and-locks and stops serving content, and the extension sends `force_submit` to the student's WS so the client UI reflects the lock.
 14. **Exam stop.** Staff clicks *Stop proctoring* per RFD 0011. Extension closes all WS sessions for the exam with a `session_ended` frame, marks any unreviewed captures accordingly in the audit log, and runs RFD 0011's room-deletion path. Captured images remain in the object store under the 30-day lifecycle rule (or indefinitely if under a `held/` hold).
 
+## Lock Recovery: Suspend vs Revoke, and the Reconciler (R5)
+
+The lifecycle above locks a session in two shapes the shipped implementation added but this
+RFD never gave a recovery path: the **collection force-submit** (a timer at
+`submission_collection.stop_at` emits `collection.closed`; the proctoring consumer locks the
+closed cohort) and **room end** (an invigilator ends a room; its seated sessions lock). Both
+land in the same terminal `locked` state as an invigilator `force_submit`. The problem: those
+two causes are **reversible** — a `stop_at` extension reopens the window and reschedules the
+timer; an ended room can be reopened — but the sessions they locked stay dead forever, because
+`locked` is universally terminal (no `locked → *` edge). An instructor who sets the wrong
+`stop_at` and then extends it to "give five more minutes" reopens the submission plane while
+every proctoring session remains locked, recoverable today only by a direct database write.
+
+The fix distinguishes two categories of lock, and gives the reversible one a real state.
+
+### R5.1 — Suspend (reversible) vs revoke (terminal)
+
+- **Revoke** is terminal, per-student, disciplinary: `force_submit` (identity failure, cheating).
+  It keeps the `locked` state and the `proctoring.session.revoked` semantics unchanged. There is
+  no undo (see Open Items for whether mis-click recovery is ever wanted).
+- **Suspend** is reversible and cause-scoped: `collection_closed` (window force-submit) and
+  `room_ended` (room closed). Room-end **must** carry a `room_ended` reason distinct from the
+  per-student `invigilator` revoke, so a room reopen can reinstate its cohort without disturbing
+  a student who was individually revoked while seated there.
+
+A new non-terminal admission state **`suspended`** holds a reversible lock. A suspended and a
+revoked student are both *blocked* — all deny-gates key off `locked_at != nil`, which stays set
+on suspended rows, so no gate changes — but only `suspended` is recoverable, and the
+student-facing copy differs off the reason ("the exam window closed, please wait" vs "you have
+been removed"). Reversibility that drives copy, rendering, escalation, and eligibility **is** a
+state, not metadata; `locked` stays *truly* terminal. Edges: `* → suspended` (any suspend
+cause), `suspended → locked` (an invigilator escalates a suspended student to a disciplinary
+revoke), `suspended → resume_state` (reinstate).
+
+`resume_state` is a nullable column snapshotting the pre-suspend admission state, written
+**atomically inside the suspend UPDATE** (`SET resume_state = state, state = 'suspended' WHERE
+state NOT IN ('suspended','locked')`), cleared on reinstate/escalation. It is necessary for
+robustness-to-evolution, not for today: every currently-*reachable* state is reconstructable
+from markers (`policy_snapshot`, captures, `content_released_at`) **only because
+`physically_verified` has no writer yet** — the day a physical-verify endpoint ships, marker
+re-derivation silently regresses a verified student to `admitted` and destroys the invigilator's
+attestation. The snapshot has zero staleness hazard (it is one write with the lock) and composes
+correctly under double-suspend: a session suspended by a collection close and then by a room end
+takes the second suspend as a no-op (its row is already `suspended`), preserving the first
+snapshot.
+
+### R5.2 — One predicate, level-triggered; events are nudges
+
+Recovery is **not** event-driven. An edge-triggered reopen with a timestamp guard is unsound:
+during the force-submit fire window, an extend can emit "reopen" before the in-flight
+`ForceSubmitCollection` publishes "closed", and any `locked_at`-vs-event monotonicity check then
+either rejects the valid reopen (deadlock) or, under clock skew, reinstates after a newer close.
+Both directions of the lock flow instead through a single **level-triggered reconciler** (an
+extension of the existing per-activity terminal sweep) computing one predicate:
+
+> A session is **admission-eligible** iff the student is a member of **at least one currently
+> open collection window** on the activity **and** their room is **not ended**. It is
+> **suspend-eligible** iff neither holds. Revoked (`locked`) sessions are never touched.
+
+The reconciler locks what should be locked and reinstates any `suspended` session for which the
+predicate now holds (restoring `state := resume_state`, clearing the lock fields, bumping
+`server_seq`, inserting a durable `session_reinstated` frame). The stored `locked_reason` is
+advisory (copy + audit) only — reinstate is gated on live truth, which is what lets a session
+suspended by *two* causes wait until *both* clear, something a reason-gated predicate cannot
+express. `collection.closed`, `collection.reopened`, room-end, and room-reopen all degrade to a
+pure `ScheduleLockReconcile(activity_id)` nudge with the periodic sweep as the durability
+backstop; no event carries authority, and every failure mode is bounded at one sweep interval.
+
+This is affordable precisely because **proctoring is a downstream control plane**: submission has
+zero reads of proctoring state, and the authoritative answer-integrity fence is the submission
+force-submit at `stop_at`. The proctoring lock only tears down the invigilation session (WS /
+media / capture), never a delivery. So the lock's **latency** is free — a session lingering a few
+seconds past close cannot be exploited (submission is already frozen), which is why the original
+consumer was async. What must be correct is the lock's **authority**: a *wrong* lock (re-suspending
+a validly-extended student) kicks them to the locked screen mid-exam, so the reconciler — not a
+stale event — is the sole writer of session-blocked state.
+
+Two consequences of the "one predicate" resolution, decided:
+
+- **Multi-collection membership: any-open-wins.** The session is one-per-activity but cohorts are
+  per-collection; a student in a closed main collection and an open accommodation collection is
+  reinstated (their live window is open). Holding until *every* collection reopens would deadlock
+  the extra-time student — the flagship case. The residual risk (a student erroneously in an extra
+  open collection may sit during it) is a collection-membership problem already true of the
+  submission plane, not one proctoring should second-guess. This requires extending the
+  `activity_state` contract to answer **per-user open-collection membership** (today it answers only
+  "every collection closed" over the whole-activity union).
+- **Room un-ending is window-bounded.** A room is reopenable only while the activity has a live
+  open window — the same predicate. This makes reopen meaningful only during an active sitting and
+  avoids both an arbitrary grace timer and resurrecting a room long after the exam.
+
+### R5.3 — The two corrections
+
+- **Extend the exam window.** For `kind='exam'` the decided invariant is `stop_at == due_at`; the
+  extend operation moves both together atomically (the code today enforces only the weaker
+  `due_at >= stop_at`, so a naive "push `stop_at`" PATCH 400s on the due-at guard while students sit
+  suspended). It reschedules the force-submit timer and, post-commit, calls the reconcile scheduler
+  **in-process** — not via the `collection.updated` event, which publishes per collection *group*
+  and so emits nothing for a user-audience (accommodation) collection.
+- **Reopen an ended room.** A new `ended → open` transition (the existing status CAS cannot express
+  it) that clears `ended_at` and nudges the reconcile. Un-ending is safe: room-end is a pure status
+  CAS plus the session-lock loop — it seals no evidence and tears down no LiveKit (rooms are lazily
+  re-provisioned on token issuance). The successor-room alternative is dead: re-seating a
+  mid-exam student with an existing session is deferred by design, i.e. the whole cohort. The
+  reconciler's lock direction and its `liveActivityIDs` scope must widen to cover all-ended-room
+  activities, or a room whose rooms are all ended is excluded from the very sweep meant to reinstate
+  it, and a reinstate that races a re-end escapes permanently — so reinstate must be one transaction
+  taking the sweep's advisory lock and re-reading `room.status FOR SHARE` before its CAS.
+
+### R5.4 — Authorization
+
+Following the existing split (routine per-room invigilation = `can_proctor(room)`; structural
+correction = `can_edit(proctoring_activity)`), scaled by blast radius:
+
+| operation | relation | rationale |
+| --- | --- | --- |
+| extend exam window | `can_edit(activity)` (submission) | an academic-schedule change; not an invigilator's to make unilaterally |
+| reopen ended room | `can_proctor(room)` | **symmetric with `end`** (also `can_proctor`) — the invigilator who mis-ended undoes it; ending already mass-locks the cohort, so reopening mass-reinstating it is the same power |
+| per-student reinstate | `can_edit(proctoring_activity)` | mass-readmit; structural |
+| escalate `suspended → locked` | `can_proctor(room)` | routine discipline; mirrors `force_submit` |
+
+`can_edit(activity)` inherits `can_edit(proctoring_activity)` (via the activity parent), and
+`chief` is *inside* `can_edit(proctoring_activity)` — so a course editor drives every correction,
+and a **chief** drives room recovery fully but **not** the window extend (they lack
+`can_edit(activity)`). That split is deliberate separation of duties: room lifecycle is the chief's
+domain; moving an academic deadline is the coordinator's. We do **not** carve `chief` out of the
+grant — doing so would need a new relation and strip chiefs of rooms/roster/assignments too. A full
+authz pass may revisit personas; this is the provisional model.
+
+### R5.5 — Freeze-race semantics and a latent bug
+
+During the extend-vs-fire race, the student's staged work is force-committed at the *old* `stop_at`;
+after reinstate they re-stage and are force-committed again at the new one. This is **accepted**: no
+un-commit exists, exam collections are `score_selection=latest` so the phantom commit never wins,
+and the cost of rolling back a committed Temporal force-submit is not worth a rare, harmless record
+artifact — the phantom is logged for forensic clarity. Separately, the reconciler's lock direction
+must re-verify live closed-state before suspending (or be a pure nudge), or the same race produces a
+≤5-minute cohort-wide mid-exam suspension flicker.
+
+This design also surfaces a **live bug independent of it**: the bulk-lock query guards
+`AND state <> 'locked'` and the invigilator-lock / room-end paths discard the returned row count and
+return success unconditionally — so an invigilator lock on an already-suspended student is a silent
+no-op, leaving the row tagged `collection_closed` for a later reopen to resurrect. Under R5 that path
+*is* the `suspended → locked` escalation edge; the fix (a zero-row lock is an error/escalation, not a
+false success) needs three distinct SQL primitives — suspend, escalate, revoke — because the F13
+consumer and the sweep require zero-rows-is-success (idempotent re-lock) while the interactive lock
+requires zero-rows-is-error.
+
+### R5.6 — Open Items
+
+- **Client recovery channel (requirement, not nicety).** A student who reloaded on the locked screen
+  cannot receive the `session_reinstated` frame (its delivery channels sit behind the same
+  `locked_at` deny-gates). The locked/suspended screen **must** poll or retry `session create` on a
+  timer — it is the only recovery path for the common "closed the laptop" case.
+- **`physically_verified` writer** — when it ships, it needs a persisted attestation independent of
+  FSM state (this is what makes `resume_state` load-bearing).
+- **Attendance finalization** (`assignment.status = no_show`, currently unwritten) must be
+  un-finalized by reinstate if/when a writer exists.
+- **Invigilator-lock undo** — deliberately terminal here; a future `locked → suspended` demotion
+  should be banned on purpose, not left ambiguous.
+
 ## Alternatives Considered
 
 ### Alternative A: non-extractable WebCrypto keypair as a device-binding fallback (rejected)
