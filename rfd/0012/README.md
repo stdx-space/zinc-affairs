@@ -469,9 +469,15 @@ Two consequences of the "one predicate" resolution, decided:
 - **Extend the exam window.** For `kind='exam'` the decided invariant is `stop_at == due_at`; the
   extend operation moves both together atomically (the code today enforces only the weaker
   `due_at >= stop_at`, so a naive "push `stop_at`" PATCH 400s on the due-at guard while students sit
-  suspended). It reschedules the force-submit timer and, post-commit, calls the reconcile scheduler
-  **in-process** — not via the `collection.updated` event, which publishes per collection *group*
-  and so emits nothing for a user-audience (accommodation) collection.
+  suspended). It reschedules the force-submit timer — and **fails the request if that reschedule
+  fails** (a 200 with the timer still armed at the old `stop_at` would fire the old force-submit
+  mid-extension; the 5xx demands the operator retry, which is safe — the extend is re-appliable and
+  the schedule is terminate-and-replace). Post-commit it emits a dedicated
+  `collection.reopened` **NATS nudge unconditionally** (extend lives in the submission extension and
+  the reconciler in proctoring, so "in-process" is impossible; the dedicated emission also routes
+  around the `collection.updated` per-collection-*group* publish, which emits nothing for a
+  user-audience (accommodation) collection). The nudge carries no authority; the periodic sweep is
+  the durability backstop for a lost emission.
 - **Reopen an ended room.** A new `ended → open` transition (the existing status CAS cannot express
   it) that clears `ended_at` and nudges the reconcile. Un-ending is safe: room-end is a pure status
   CAS plus the session-lock loop — it seals no evidence and tears down no LiveKit (rooms are lazily
@@ -491,7 +497,7 @@ correction = `can_edit(proctoring_activity)`), scaled by blast radius:
 | --- | --- | --- |
 | extend exam window | `can_edit(activity)` (submission) | an academic-schedule change; not an invigilator's to make unilaterally |
 | reopen ended room | `can_proctor(room)` | **symmetric with `end`** (also `can_proctor`) — the invigilator who mis-ended undoes it; ending already mass-locks the cohort, so reopening mass-reinstating it is the same power |
-| per-student reinstate | `can_edit(proctoring_activity)` | mass-readmit; structural |
+| per-student reinstate | `can_edit(proctoring_activity)` | mass-readmit; structural. **Deferred** (not in the initial implementation): the reconciler is the sole writer of session-blocked state, and both shipped corrections recover whole cohorts through it — a per-student override endpoint would bypass the live-truth predicate and immediately be re-suspended by the sweep unless the underlying cause cleared, so it only becomes meaningful alongside a per-student cause exemption. Revisit with the full authz pass. |
 | escalate `suspended → locked` | `can_proctor(room)` | routine discipline; mirrors `force_submit` |
 
 `can_edit(activity)` inherits `can_edit(proctoring_activity)` (via the activity parent), and
@@ -521,12 +527,31 @@ false success) needs three distinct SQL primitives — suspend, escalate, revoke
 consumer and the sweep require zero-rows-is-success (idempotent re-lock) while the interactive lock
 requires zero-rows-is-error.
 
+**Implementation refinements (found building it, now normative):** (1) The suspend predicate is
+`∈ closed-cohort ∧ ∉ open-cohort`, NOT merely `∉ open` — the naive form suspends every
+pre-registering student during the `before` window (rooms deliberately open early for
+device-proof/capture), so the `activity_state` contract carries `closed_user_ids` alongside
+`open_user_ids`, plus an explicit `is_exam` gate (the countdown-derived `state` string is
+best-effort and conflates "read failed" with "not an exam"). (2) The suspend direction has a
+**room arm** in the same reconcile txn — a lockable session seated in an ended room is suspended
+`room_ended` — making room-end level-triggered too (an interactive `End()` whose suspend leg fails
+is healed by the sweep; `End()` itself is one transaction). (3) Lock ordering is **room → session
+in every transaction** (the reconcile pins non-ended rooms FOR SHARE before any session write;
+`End()` takes the room CAS before its suspend loop) — the opposite interleaving deadlocks at
+exam-end timing. (4) The interactive lock is idempotent on an already-**locked** target (returns
+the existing lock time) and errors only when there is no lockable session — preserving the
+pre-R5 double-click contract while still escalating a suspended target.
+
 ### R5.6 — Open Items
 
 - **Client recovery channel (requirement, not nicety).** A student who reloaded on the locked screen
   cannot receive the `session_reinstated` frame (its delivery channels sit behind the same
   `locked_at` deny-gates). The locked/suspended screen **must** poll or retry `session create` on a
   timer — it is the only recovery path for the common "closed the laptop" case.
+- **Mid-exam unenrollment.** A student removed from all of an activity's collections mid-exam leaves
+  BOTH membership sets, so the collection arm no longer suspends them (the roster soft-withdraw skips
+  seats with live sessions); their session stays live until room-end. A rare admin action; the
+  eventual answer is probably a roster-reconcile-driven suspend cause, decided with the authz pass.
 - **`physically_verified` writer** — when it ships, it needs a persisted attestation independent of
   FSM state (this is what makes `resume_state` load-bearing).
 - **Attendance finalization** (`assignment.status = no_show`, currently unwritten) must be
