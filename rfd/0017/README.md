@@ -145,11 +145,16 @@ whole order authority for the viewer, not a shuffle overlay.
   sibling set) — authoring, preview, grading, and export always show canonical
   order.
 - **Examinee callers** are gated exactly like content reads (open collection
-  window, proctoring admission where applicable, and the post-exam review
-  path wherever question content is readable — the layout must remain
-  readable in review so students see the order they actually sat). Sibling
-  sets under a shuffle-enabled parent are permuted per student; all others are
-  canonical.
+  window, proctoring admission where applicable). Sibling sets under a
+  shuffle-enabled parent are permuted per student; all others are canonical.
+  The standing invariant is **gating parity**: `/layout` is readable by an
+  examinee exactly wherever question content is readable, no wider. Note that
+  today the server exposes *no* post-window examinee content path at all
+  (verified: every content read requires an open collection), so post-window
+  student review of one's own paper — in one's own seeded order — requires a
+  deliberate product decision to open a review read path (natural shape:
+  reuse the published-answer visibility/release keys, applied uniformly to
+  content *and* layout, never layout alone). Deferred; see Open questions.
 
 Shape rationale: the client learns tree *structure* from `context_relation`
 and needs only per-sibling-set ordering, which the map provides directly — a
@@ -311,6 +316,15 @@ Verification includes a live two-browser drive on a simulate stack: two
 students in one shuffled exam (different orders, stable across reload,
 identical outside shuffled contexts), hierarchical numbering, per-viewer
 mention rendering, and post-close review parity.
+
+## Open questions
+
+- **Post-window student review order.** Should students be able to revisit
+  their paper after the window closes, in the order they sat it? The server
+  currently denies all post-window examinee content reads (pre-existing;
+  unrelated to this feature), so this needs a deliberate access-surface
+  decision — publishedanswer-keyed, content and layout uniformly — before the
+  results view can render a re-fetched paper. Owner call.
 
 ## Out of scope / future work
 
