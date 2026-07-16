@@ -187,19 +187,25 @@ Because the client cannot hold the HMAC key, the server serves the
 permutation (D3) rather than a seed — which is also what keeps the canonical
 order unobservable to students.
 
-### D5. Hiding `sort_order` from examinees
+### D5. Hiding canonical order from examinees
 
 Sibling order spans two list endpoints (contexts and questions are separate
 resources), so raw `sort_order` in those payloads is the merge key — and,
 today, the student client's only use of it is sorting. Once the layout
-endpoint exists, an examinee response containing `sort_order` would hand back
-the canonical order and defeat the shuffle. Therefore:
+endpoint exists, an examinee response revealing canonical order would defeat
+the shuffle. Therefore:
 
 - **Staff reads keep `sort_order`** (the authoring tree legitimately needs the
   cross-list merge key).
 - **Examinee-path reads omit/zero `sort_order`**, role-keyed off which
   authorization path admitted the request — not by forking endpoints. The
   student client's ordering source becomes the layout map exclusively.
+- **Examinee-path list responses are additionally returned in id order, not
+  canonical array order.** (Adversarial-review finding: zeroing the field
+  alone is insufficient — the response array itself was still sorted by
+  `sort_order`, letting an API-literate student reconstruct canonical order
+  from raw responses. The client never relies on array order once it consumes
+  the layout map, so id-ordering the examinee arrays costs nothing.)
 
 ### D6. Grading safety (invariant, test-enforced)
 
@@ -235,6 +241,39 @@ Small, no schema change: an optional `parent_description_id` on context
 creation (create-in-place, atomic with the relation row), write-time cycle
 rejection on reparent, the depth-cap validation from D1, and multi-level
 sidebar grouping in the student app.
+
+Structural-integrity writes (reparent, create-with-parent) validate and write
+inside one transaction holding a **per-document row lock**: the cycle/depth
+checks are check-then-write, and without document-scoped serialization two
+concurrent reciprocal reparents (A→B, B→A) each pass their check and commit a
+real cycle — an in-memory mutex cannot prevent this across replicas.
+Validation runs **before** any content side effects (a rejected create must
+leave no orphan meta rows, or a client-supplied id becomes permanently
+un-creatable).
+
+### D9. Known properties and operational caveats (reviewed, accepted)
+
+- **Mid-exam authoring edits re-permute.** The permutation is a stateless
+  function of the canonical sibling list, so adding/removing/reordering items
+  under a shuffled parent mid-window re-shuffles that sibling set for every
+  student (gap-rebalancing is order-preserving and safe). Mid-exam structural
+  edits are already discouraged; this is documented rather than defended
+  against. Toggling a shuffle flag mid-window likewise flips that parent for
+  all students.
+- **Exam bundles round-trip the flags.** `shuffle_children` (document and
+  context) is part of the bundle schema; export/apply preserve it (a silent
+  default-off on re-import was an adversarial-review finding, fixed).
+- **Depth cap vs old bundles:** a bundle nesting contexts 3+ deep (previously
+  unvalidated) now fails apply with the depth-cap fault.
+- **Layout endpoint is uncached** (3 reads + O(N) shuffle per call) — same
+  scope as existing per-document reads; revisit only if live-exam polling
+  shows pressure.
+- **Client degrade path:** if the layout fetch fails outright, the student
+  client falls back to deterministic id-order (canonical order is
+  deliberately unavailable to examinees) so the exam stays takeable; the
+  layout query is otherwise pinned (`staleTime: Infinity`) so a background
+  refetch can never reorder a live sitting even if server determinism were
+  violated.
 
 ## Alternatives considered
 
