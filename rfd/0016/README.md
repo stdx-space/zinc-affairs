@@ -237,6 +237,45 @@ subscribes loses the first ~1–2 s of each segment. Acceptable for evidence
 behind an in-person invigilator; recorded here so nobody rediscovers it as a
 bug.
 
+### Coupling to the proctoring lifecycle
+
+Recording has **no state machine of its own and no explicit sync** with the
+RFD 0012 session FSM. The coupling is one-directional and derived: the
+proctoring lifecycle drives the media plane (which tracks exist), and the
+media plane drives recording (which egresses run). There is deliberately no
+"exam started, begin recording" event — **publication is the trigger**. A
+track can only exist for an *admitted* session (the media shell mounts
+post-admission, under `live_media`), so recording inherits every
+admission-side gate transitively: nothing is recorded during
+`pending_device_proof` / `awaiting_capture` / `awaiting_attach` (identity
+evidence there is `capture`'s job), and the `track_published` handler
+resolving identity → session only ever finds admitted sessions.
+
+Per lifecycle event:
+
+| Proctoring event | Media-plane effect | Recording effect |
+|---|---|---|
+| Session admitted, shell mounts | tracks publish | webhooks → segments start (policy permitting) |
+| Disconnect / reconnect (reentry) | tracks unpublish, republish (new SIDs) | segment ends (`track_unpublished`), new segment rows; reentry keeps one session row, so history accumulates under one `session_id` |
+| Session locked (invigilator lock / force-submit) | client teardown → tracks unpublish | segments end naturally; the sweep is the backstop for a lingering client |
+| Re-seat mid-exam | nothing (sessions are not room-keyed) | later segments carry the new `room_id` snapshot |
+| `apply_to_active` policy flip | nothing immediate | sweep starts egresses for live tracks (mode on) / stops running ones (mode off); quality applies at next publish |
+| Room `ended` (terminal) | all participants torn down → tracks unpublish | all segments end; the room leaves the sweep's active set |
+
+The sweep is where the "sync" actually lives, stated as one invariant:
+*expected egresses = admitted, unlocked sessions × recording policy ×
+currently-published tracks*. Every transition above merely changes an input
+to that equation; no proctoring code needs to know recording exists.
+
+The reverse direction is deliberately absent: recording never gates the FSM.
+Admission does not wait for an egress to start, a lock does not wait for
+segments to finalize (`egress_ended` arriving after room end is just a late
+terminal row update), and an egress failure never blocks or flags the
+attempt (see [Failure stance](#failure-stance--observability)). The only
+post-hoc join between the two worlds is the evidence timeline: recording
+rows key on `session.id`, so segments and gaps line up against the same
+session's WS/media events at review.
+
 ### Why not the alternatives
 
 | Lifecycle lever | Webhooks | SFU auto-track-egress | Temporal per student |
