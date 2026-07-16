@@ -176,13 +176,59 @@ pushing fps toward zero — a static screen costs near-nothing at 1 fps and at
 Numbers are server-owned and tunable without a client release (see
 [Policy schema](#policy-schema)).
 
-### Caveats (spike-verify before locking preset numbers)
+### Spike results (2026-07-16)
 
-- **Keyframe cadence at very low fps.** H.264 keyframes are frame-count/PLI
-  driven; at 1 fps they can be sparse → coarse seeking in the recorded file
-  and slower recovery after packet loss. 2–5 fps may be the practical floor;
-  a preset spike must confirm seekability of the recorded mp4. Until proven,
-  the lowest preset ships at 2 fps.
+Both pre-implementation spikes ran on the simulate stack: four ~7-minute
+**track-egress** recordings of a synthetic 1080p exam screen (code editor +
+per-second countdown) published from headless Chrome (livekit-client 2.20.0,
+H.264, `contentHint: 'detail'`, simulcast off, 250 kbps cap, 1–2 fps).
+
+**Storage rate** (steady state; the first minute carries the one-time
+keyframe and encoder settling, ~60–70 KB):
+
+| Variant | Measured | Per 2 h exam |
+|---|---|---|
+| 2 fps, static screen (cursor blink only) | 0.9 kbps ≈ 0.4 MB/h | ~0.8 MB |
+| 1 fps, active typing | 1.9 kbps ≈ 0.8 MB/h | ~1.6 MB |
+| 2 fps, active typing | 2.5 kbps ≈ 1.1 MB/h | ~2.2 MB |
+| 2 fps, continuous scrolling (worst realistic) | 7.8 kbps ≈ 3.4 MB/h | ~6.8 MB |
+
+Delta encoding does exactly what the design bet on: measured rates sit two
+orders of magnitude below the 250 kbps cap. The cap stays the *guarantee*
+(~225 MB/student/2 h); the *expectation* for a 100-student 2 h exam is well
+under 1 GB total, not 22 GB. Caveat: the canvas-rendered screen is cleaner
+than a real desktop capture (no images, PDFs, or anti-aliasing noise) —
+treat real-world as several × the table, still nowhere near the cap.
+
+**Keyframes & seekability:** the recorded stream carries exactly **one
+keyframe, at t=0**, regardless of fps — libwebrtc emits keyframes on demand
+(PLI) and egress subscribes once, so no periodic keyframes ever arrive.
+Consequences, all acceptable:
+
+- Playback is correct start-to-end; duration and stream metadata are right
+  (1080p, H.264 Constrained Baseline); text is pixel-crisp at these
+  bitrates — the countdown is legible to the second.
+- Seeking decodes forward from t=0: measured ~0.3–0.5 s anywhere in a 7-min
+  file, scaling roughly linearly with target position → single-digit seconds
+  to cold-seek the tail of a 2 h file at 2 fps. Fine for evidence review; if
+  scrubbing UX ever matters, the fix is a post-processing remux that injects
+  keyframes (the deferred Temporal hook), not a publisher change.
+- The mp4 is **not faststart** (moov atom at the tail): players must issue
+  HTTP range requests against the presigned URL — browsers and MinIO/RustFS
+  both do this natively.
+
+**1 fps vs 2 fps:** both recorded flawlessly — no stall, no keyframe
+starvation, exact frame cadence in the file. 1 fps saves only ~0.3 MB/h over
+2 fps, so the floor preset stays **2 fps** for twice the temporal evidence
+granularity. The `evidence_low` numbers are confirmed as specced.
+
+**Track-egress mechanics confirmed:** H.264 in → `.mp4` out (egress appends
+the extension to the templated object key); egress also uploads a small
+`EG_*.json` manifest sidecar next to the media file — the implementation
+either sets `disable_manifest` in the file output or accounts for the
+sidecar when listing objects.
+
+### Remaining caveats
 - **The track is shared with live invigilation.** Whatever the student
   publishes is what the invigilator grid renders. 1–3 fps screen share is
   acceptable live; a 1 fps *camera* would feel broken — hence per-source
@@ -427,7 +473,8 @@ JWT):
 - **Fetch:** short-TTL (~2 min) presigned GET minted after the authz check —
   house style for plaintext artifacts (cf. pipeline `result_read`). Range
   requests work natively against MinIO/RustFS, so video seeking is free; no
-  proxy streaming.
+  proxy streaming. (Spike-verified: the recorded mp4 keeps its moov atom at
+  the tail, so range support is load-bearing for browser playback.)
 - **Every mint writes a `proctoring.audit_log` row** — accessing evidence is
   itself evidence, and this future-proofs institutional privacy-policy
   conversations.
@@ -437,9 +484,10 @@ JWT):
   with no app-side encrypt hook. If evidence policy ever demands
   client-managed keys, that becomes a post-processing step (and the natural
   trigger to revisit Temporal); explicitly out of scope for v1.
-- **Retention:** real-exam capacity/retention (≈22 GB per 100-student exam at
-  `evidence_low`; staging RustFS is 10 Gi) is a deployment decision deferred
-  with the retention jobs. The schema (`held`, `purged_at`) is already shaped
+- **Retention:** real-exam capacity/retention (cap ≈22 GB per 100-student
+  exam at `evidence_low`; spike-measured expectation well under 1 GB; staging
+  RustFS is 10 Gi) is a deployment decision deferred with the retention
+  jobs. The schema (`held`, `purged_at`) is already shaped
   for it.
 
 ## Failure stance & observability
@@ -476,8 +524,9 @@ secondary evidence.
 - **Deployment:** webhook URL + signing-key knob in every LiveKit deployment
   (staging manifest, simulate stack); egress infra itself is already deployed
   in both environments.
-- **Spikes before locking preset numbers:** keyframe cadence / seekability at
-  1–2 fps; measured storage rate on a realistic exam screen.
+- **Pre-implementation spikes: done** (2026-07-16, simulate stack) — see
+  [Spike results](#spike-results-2026-07-16). Preset numbers confirmed; no
+  open questions block implementation.
 
 ## Abandoned Ideas
 
