@@ -1069,7 +1069,10 @@ components wrap their computed score in the same guard
 the denominator: the initial schema default sums *every* question's
 marks (core `database/migrations/000001_initialize_schema.up.sql:930-940`,
 whose comment records the reversal), and the console's structured form
-was aligned to match.
+was aligned to the same expression — its surviving trace is
+`LEGACY_AUTO_MAX_SCORE_EXPR` in
+`apps/console/app/lib/scoring-policy/index.ts:453`, retained only to
+explain the pre-derived bodies described in (C).
 
 *That default has since been replaced entirely.* The current column
 default is
@@ -1102,8 +1105,16 @@ statements of the paper's size, and they disagree in practice:
 - A coding question emits **one component per knob**, with
   author-written literal `max_score`s. This RFD assumed a coding
   component's max would be the question's marks; multi-knob practice
-  writes literals, and nothing validates that a question's knob maxes
-  sum to its marks. So Σ question marks ≠ Σ component maxes, silently.
+  writes literals instead, so Σ question marks ≠ Σ component maxes. The
+  derived-max work added a generator check for exactly this: when every
+  knob's max is a static number literal and their sum differs from the
+  question's marks, it emits a `SeverityWarning` — *"knob max_scores sum
+  to N but the question carries M marks"* (core
+  `internal/pipeline/configgen/generator.go:150-167`). A warning, never
+  an error: the generator still materializes. The check is deliberately
+  **skipped** when any knob max is a non-literal expression
+  (`knobMaxScoreSum`, `configgen/coding.go:243-255`) — that is the case
+  where the divergence stays silent.
 - A **fixed** max over a weighted total discards the weights entirely —
   no consumer can judge the declared max against what is achievable.
 - A **question-marks** max over a weighted total is worse: the total
@@ -1134,7 +1145,11 @@ expanded **per question**, keyed by question id, with
 `covers = [id]`, `max_score = marks`, and the manual-override guard
 (`emit.go:101-112`, `generator.go:208`). The pipeline stays batched; only
 the scoring unit became per-question. This is what makes "the sum of
-every component's max" a faithful reading of the paper.
+every component's max" a faithful reading of the paper. Note also that
+the modality set that section enumerates is no longer complete — an
+`msq` modality ships (core `internal/pipeline/configgen/input.go:20,71`)
+that this RFD never mentions; documenting it is out of this amendment's
+scope.
 
 #### B. The weighted-total form
 
@@ -1155,14 +1170,24 @@ total     = component["mc"].score * 2 + component["q3"].score * 1
 ```
 
 (console `apps/console/app/lib/scoring-policy/index.ts:73-110` —
-the max terms mirror the total's terms exactly, in the same order.) **No
-`weight` attribute is written by anything.** The generator has no weight
-input at all — its `Input` is questions + marking schemes + the policy
-body (core `internal/pipeline/configgen/input.go:73-85`) — and emits
-none. The `weight` attribute remains part of the v3 formula language and
-still defaults to `1` (core `internal/pipeline/formula_types.go:50`,
-`internal/pipeline/evaluate.go:465`); it is simply not the channel this
-feature uses.
+the max terms mirror the total's terms exactly, in the same order.)
+**The generator neither consumes nor emits a `weight`.** It has no
+weight input at all — its `Input` is questions + marking schemes + the
+policy body (core `internal/pipeline/configgen/input.go:73-85`) — and a
+grep of `internal/pipeline/configgen/` for `weight`, tests included,
+returns zero hits.
+
+The attribute is not dead, though: it remains part of the v3 formula
+language, still defaults to `1`, and is still evaluated and linted
+(core `internal/pipeline/formula_types.go:50`,
+`internal/pipeline/evaluate.go:465`,
+`internal/pipeline/lint_types.go:170,202`). A **coding author** can
+therefore still write `weight` inside a knob's `component` block: the
+fragment's body is spliced verbatim (`ParseCodingFragment` has no
+attribute allowlist and `bodyTextWithoutAttr` strips only `score` —
+`configgen/coding.go:123-170`), so an author-written weight reaches the
+emitted formula and takes effect. What changed is that weight is not the
+channel the **weighted-total feature** uses.
 
 **Why.** The same defect class, forced by this RFD's own model:
 
@@ -1175,10 +1200,13 @@ feature uses.
   canonical state — a per-component weight stored on the document —
   alongside a `total` expression that references it. Two authored
   statements of one weighting, again.
-- The only write path for scoring is `PUT
+- The scoring surface the console writes is `PUT
   /documents/{document_id}/scoring-policy` (core
-  `internal/api/examination/scoring_policy.go:25`); the hand-authored
-  config editors were removed when the derived-config model landed.
+  `internal/api/examination/scoring_policy.go:25`) — the policy body, not
+  the config. The hand-authored pipeline/formula editors were removed
+  when the derived-config model landed (ui commit `25487fe7`, "Remove the
+  hand-authored pipeline/formula editors… no write path for the config
+  remains").
 - Keeping both halves in one body is what makes the derived max
   *checkable*: recognition requires the max's `(name, weight)` terms to
   match the total's exactly and in order, otherwise the policy is
