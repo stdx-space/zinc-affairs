@@ -1023,3 +1023,234 @@ with confusing missing-fixture errors), and can't house real
 per-language scaffolding in one universal template. The no-op default +
 language-template picker replaces it: materializes cleanly, scores
 zero, signals "configure me" without crash-flavored errors.
+
+## Amendments
+
+Amendments record where the shipped implementation deliberately diverged
+from the design above. **The body of this RFD is left exactly as
+written** — it is the historical design record, not a description of the
+running system. Where an amendment and the body disagree, the amendment
+and the durable package docs it points at are authoritative.
+
+### 2026-08-12 — Scoring policy: the max is derived, the weights are inline
+
+Affects [Scoring policy](#scoring-policy), [Generation
+contract](#generation-contract), and the "Manual essay grading" item in
+[Open follow-ups](#open-follow-ups).
+
+Two divergences, one root cause worth naming before the details: **two
+independently-authored statements of the same fact, reconciled nowhere.**
+In both cases the design put a number in one place and the thing that
+number describes in another, with nothing keeping them honest — so the
+implementation collapsed the pair into a single authored statement and
+derived the other.
+
+#### A. The default `scoring_policy_hcl`
+
+**The RFD says** a document is created with
+
+```hcl
+max_score = sum([for q in document.examination.questions : q.marks if q.type != "essay"])
+```
+
+— essays excluded from the denominator "until manual grading ships",
+flagged in Open follow-ups as a future breaking change.
+
+**What shipped**, in two steps.
+
+*Essays were never excluded in a deployed default.* Manual grading did
+not arrive as a separate surface; it arrived as a **per-component manual
+override**, which made essays gradable without a new denominator story.
+Every essay question emits a real component scored
+`try(manual["<qid>"], 0)` (core `internal/pipeline/configgen/emit.go:125`,
+called from `configgen/generator.go:176`), and objective and coding
+components wrap their computed score in the same guard
+(`emit.go:101`, `emit.go:177`). Essays are gradable, so they belong in
+the denominator: the initial schema default sums *every* question's
+marks (core `database/migrations/000001_initialize_schema.up.sql:930-940`,
+whose comment records the reversal), and the console's structured form
+was aligned to match.
+
+*That default has since been replaced entirely.* The current column
+default is
+
+```hcl
+max_score = sum([for _, c in component : c.max_score])
+```
+
+(core `database/migrations/000021_scoring_policy_derived_default.up.sql`,
+pinned by `database/scoring_policy_default_test.go:21`; the same string
+is a named constant on both sides —
+`internal/api/examination/authoring_summary_service.go:36` and console
+`apps/console/app/lib/scoring-policy/index.ts:19`). The max is now
+**derived from the total's own structure** — the total expression with
+each component's score replaced by that component's max — and a numeric
+literal is no longer "the other automatic mode" but an explicit **cap
+override** ("70 marks available, scored out of 60").
+
+The engine was extended to support this: `scoring.max_score` and
+`scoring.min_score` evaluate in a parse-phase **component-meta** scope —
+`component` as `{max_score, weight}` per component, deliberately without
+`score`, since a max depending on scores would be circular (core
+`internal/pipeline/evaluate.go:678-700`, `scoringMetaContext` at
+`evaluate.go:830-865`, lint contract in
+`internal/pipeline/lint_types.go:145-205`).
+
+**Why.** The RFD's expression and the achievable total are two different
+statements of the paper's size, and they disagree in practice:
+
+- A coding question emits **one component per knob**, with
+  author-written literal `max_score`s. This RFD assumed a coding
+  component's max would be the question's marks; multi-knob practice
+  writes literals, and nothing validates that a question's knob maxes
+  sum to its marks. So Σ question marks ≠ Σ component maxes, silently.
+- A **fixed** max over a weighted total discards the weights entirely —
+  no consumer can judge the declared max against what is achievable.
+- A **question-marks** max over a weighted total is worse: the total
+  computes Σ wᵢ·marksᵢ, so weights > 1 are silently truncated by the
+  clamp and weights < 1 make full marks unreachable.
+
+Deriving the max from the components deletes the second statement rather
+than trying to reconcile it. The full reasoning, the canonical
+expressions, and the recognition rules are in core
+`docs/plans/2026-08-10-scoring-derived-max.md`.
+
+Two consequences worth stating plainly:
+
+- **Existing rows are not rewritten.** Migration 000021 changes the
+  column default only. Stored bodies keep evaluating unchanged (the
+  `document` namespace is still in scope for `max_score`); in the editor
+  they fall to Advanced until a human re-states them — see (C).
+- **Open follow-ups' "Manual essay grading" item is resolved, and its
+  feared migration never occurred.** Because the essay filter never
+  reached a live default, no exam's denominator changed retroactively,
+  and `component "<essay-qid>"` blocks were emitted from the start
+  rather than added to configs already in flight.
+
+*Adjacent change this item depends on:* objective modalities no longer
+emit one `component "<modality>"` summing question marks, as [Per-modality
+emission](#per-modality-emission) shows. They emit a `dynamic "component"`
+expanded **per question**, keyed by question id, with
+`covers = [id]`, `max_score = marks`, and the manual-override guard
+(`emit.go:101-112`, `generator.go:208`). The pipeline stays batched; only
+the scoring unit became per-question. This is what makes "the sum of
+every component's max" a faithful reading of the paper.
+
+#### B. The weighted-total form
+
+**The RFD says** the *Weighted sum* option makes the generator emit
+
+```hcl
+total = sum([for n, c in component : c.score * c.weight])
+```
+
+and **write a `weight` attribute onto each component**, relying on RFD
+0013's default `weight = 1`.
+
+**What shipped** is inline weighted terms in the scoring body alone:
+
+```hcl
+max_score = component["mc"].max_score * 2 + component["q3"].max_score * 1
+total     = component["mc"].score * 2 + component["q3"].score * 1
+```
+
+(console `apps/console/app/lib/scoring-policy/index.ts:73-110` —
+the max terms mirror the total's terms exactly, in the same order.) **No
+`weight` attribute is written by anything.** The generator has no weight
+input at all — its `Input` is questions + marking schemes + the policy
+body (core `internal/pipeline/configgen/input.go:73-85`) — and emits
+none. The `weight` attribute remains part of the v3 formula language and
+still defaults to `1` (core `internal/pipeline/formula_types.go:50`,
+`internal/pipeline/evaluate.go:465`); it is simply not the channel this
+feature uses.
+
+**Why.** The same defect class, forced by this RFD's own model:
+
+- Component blocks are **generated artifacts**. The document is the only
+  canonical state and the config column is re-derived on every save that
+  touches the materializing set (core
+  `internal/api/examination/MATERIALIZATION.md`). A weight written into a
+  component block would live only in derived output. To survive
+  re-materialization it would have to become a *second* piece of
+  canonical state — a per-component weight stored on the document —
+  alongside a `total` expression that references it. Two authored
+  statements of one weighting, again.
+- The only write path for scoring is `PUT
+  /documents/{document_id}/scoring-policy` (core
+  `internal/api/examination/scoring_policy.go:25`); the hand-authored
+  config editors were removed when the derived-config model landed.
+- Keeping both halves in one body is what makes the derived max
+  *checkable*: recognition requires the max's `(name, weight)` terms to
+  match the total's exactly and in order, otherwise the policy is
+  treated as deliberately custom (`index.ts:255-273`). That check could
+  not be stated if half the pair lived in generated component blocks.
+
+#### C. Mode detection on load
+
+[UI: structured mode + advanced mode](#ui-structured-mode--advanced-mode)
+describes a non-matching body as rendering **the structured form
+read-only, with a banner showing the resolved values in plain
+language**. That is not what shipped.
+
+Recognition is **canonical spellings only**, and a non-match falls to
+**Advanced** — the raw-HCL editor, editable, with an informational
+banner. There is no read-only structured rendering (console
+`apps/console/app/lib/scoring-policy/index.ts:164-273`; editor
+`apps/console/app/components/grading/scoring-policy/scoring-policy-editor.tsx:313-345`).
+The one plain-language reading that survives is for the legacy
+pre-derived body — the state every existing document is in — which the
+banner describes as "Caps the exam at the sum of question marks — the
+pre-derived model. Re-save in Structured form to migrate."
+(`index.ts:453-472`, editor `:324-334`).
+
+**Why.** The legacy question-marks expression is deliberately *not*
+recognized as the derived form: it resolves to Σ question marks while
+the canonical form resolves to Σ component maxes, and the two diverge
+exactly when coding knobs diverge from marks. Recognizing it would
+either misreport the cap or silently rewrite it on the next save. The
+honest posture is that the body is opaque until a human re-states it as
+an explicit decision. This RFD's essay-excluding variant is likewise
+unrecognized (it was never a live default).
+
+For the same reason the "Scoring: custom (Advanced)" overview indicator
+this RFD sketches shipped as a **two-axis classification** instead —
+total: `sum` / `weighted` / `opaque`; max: `derived` / literal-with-value
+/ `opaque`, where `opaque` means the summary makes no claim on that axis
+(core `internal/api/examination/authoring_summary.go:43-46`,
+`authoring_summary_service.go:169-273`). How the Overview renders it is a
+console concern outside this amendment.
+
+#### D. The resolved-value display
+
+The RFD's *"Auto (currently: 87)"* survived in substance but not in
+wording or in basis. The mode is labelled **"Derived from the paper"**
+and the resolved value reads **"Currently: N marks."** (editor
+`:506`, `:535-537`) — resolved from the **materialized formula's
+component maxes**, not from a sum of question marks, and degrading
+honestly to "The current value cannot be resolved right now — it appears
+once the config has been materialized" when the formula read is absent
+or any needed component max is unknown (`resolveDerivedMaxScore`,
+`index.ts:406-444`).
+
+**Why.** The display exists to make the denominator verifiable without
+opening the config. A fallback computed on a different basis than the
+stored expression would be a third statement of the same fact, wrong in
+precisely the coding-knob case that motivated (A).
+
+#### Where the shipped semantics live now
+
+- core `internal/api/examination/MATERIALIZATION.md` — what
+  materialization derives from a document, when it runs, and how each
+  attempt's outcome is recorded and repaired. Supersedes this RFD's
+  [Materialization timing](#materialization-timing) as the current
+  reference.
+- core `docs/plans/2026-08-10-scoring-derived-max.md` — the derived-max
+  design: the defect class, the canonical expressions both repos must
+  agree on byte-for-byte, the recognition rules, and the core-before-
+  console deploy ordering.
+- core `internal/pipeline/USAGE.md` and `internal/pipeline/configgen` —
+  the v3 language surface and the generator's actual emission.
+- console `apps/console/app/lib/scoring-policy/index.ts` — the canonical
+  spellings and the recognized structured subset; core's Go port of the
+  same classification is
+  `internal/api/examination/authoring_summary_service.go`.
