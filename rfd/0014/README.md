@@ -132,7 +132,7 @@ marking-scheme blob.
 The organising decisions:
 
 1. **The document drives the config.** Non-coding questions (MC, TF, SA) are mechanically translated to pipeline + formula HCL by the generator. The `pipeline.config` row is derived materialized state, not authoring input. Per-question rubric data lives in the marking-scheme blob; exam-wide scoring policy lives on the document; the assembled config is a pure function of these inputs.
-2. **Coding questions are the only escape hatch.** Each coding question owns one HCL fragment — both its `pipeline "<qid>" {...}` block (the grading DAG) and its `component "<qid>" {...}` block (the score expression) — stored inside the coding question's marking-scheme blob. No other modality has an HCL surface.
+2. **Coding questions are the only escape hatch.** Each coding question owns one HCL fragment — one `pipeline "<qid>" {...}` block (the grading DAG) plus one or more `component "<label>" {...}` knob blocks (the score expressions), each label any `[a-zA-Z0-9_-]+` knob name that the generator namespaces to the global name `<qid>` (label equal to the qid) or `<qid>-<label>` — stored inside the coding question's marking-scheme blob. No other modality has an HCL surface.
 3. **Cardinality is strict: activity ↔ document ↔ config is 1:1:1.** No cross-activity reuse, no shared configs, no shared documents. To reuse grading logic, copy the document.
 4. **Configs mutate in place.** No version history on the `pipeline.config` or `evaluation.formula` rows. Past grading runs carry their results, not a snapshot of the config that produced them. Re-grading uses the current state.
 
@@ -144,9 +144,14 @@ that document. 1:1:1, enforced as a chain.
 
 Practical consequences:
 
-- The `pipeline.config` and `evaluation.formula` rows are children of
-  the document, not free-floating entities. They have no independent
-  identity.
+- The `pipeline.config` and `evaluation.formula` rows are keyed to the
+  activity (via `pipeline.config_activity` / `evaluation.activity_formula`,
+  upserted by activity id) and flagged `managed_by_document`, not FK'd to
+  the document. They are children of the activity's document by ownership
+  flag, not free-floating entities: they keep their own integer ids and
+  stay readable at `GET /configs/{config_id}` and
+  `GET /activities/{activity_id}/config`, but have no independent write
+  surface.
 - The v2 affordance "attach existing config X to activity Y" is dropped.
   Two activities cannot share grading logic; if they should, copy the
   document.
@@ -228,12 +233,14 @@ make scoring decisions):
 | `tf`     | `expected_file` (from `answer`) | ✓ | ✓ + `marks` |
 | `sa`     | `expected_file` (from `expected`); `diff_flags` (from `match_options`) | ✓ | ✓ + `marks` |
 | `essay`  | none (not auto-graded) | n/a | `marks` |
-| `coding` | none (fragment is the rubric) | n/a | `marks` |
+| `coding` | `assets` (uploaded marking-scheme files, when present; the fragment is otherwise the rubric) | ✓ | ✓ + `marks` |
 
-The generator translates the raw blob fields into the `expected_file`
-path and `diff_flags` list at materialization, so the pipeline reads
-ready-to-use values and stays agnostic to the marking-scheme's field
-names — only the generator knows the translation.
+The generator materializes only the expected-answer bytes; the
+`expected_file` path and the `diff_flags` list are built by the snapshot
+resolver (`snapshotFromInput`) when the document snapshot is resolved at
+grading-run start. The emitted HCL references `marking.expected_file` /
+`marking.diff_flags` symbolically, so the pipeline reads ready-to-use
+values and stays agnostic to the marking-scheme's field names.
 
 ### SA match options
 
@@ -273,7 +280,12 @@ Validation runs at write time (Documents-tab save path) against a
 schema chosen by the question's modality. Per-question entries are
 required to exist for every question in the document at materialization
 time; an absent marking scheme entry is a materialization-phase error
-on the next grading run.
+on the next grading run. (Amended: see Amendments, Where the shipped
+semantics live now (MATERIALIZATION.md). A missing or unauthored marking
+scheme is an authoring-class generator diagnostic raised on every
+materializing save and on the manual materialize endpoint, recorded as
+`not_applied` with the previous derived config left live; nothing
+re-materializes at grading-run start.)
 
 ### Derived assets
 
@@ -287,16 +299,29 @@ alternatives](#abandoned-alternatives)).
 
 These files are derived: a marking-scheme change re-materializes the
 affected files (and re-publishes the path into the document's synthetic
-view) before the save returns. Asset-write semantics — idempotency,
+view) before the save returns. (Amended: see Amendments, Where the
+shipped semantics live now (MATERIALIZATION.md). Re-materialization is
+synchronous in-request but only on saves that move active marking-scheme
+state; it is best-effort and rewrites every expected file document-wide,
+not only the affected ones, and no path is re-published, since
+`marking.expected_file` is a fixed convention the snapshot resolver
+derives at grading-run start.) Asset-write semantics — idempotency,
 atomicity, the exact path scheme — are the runtime RFD's concern; this
 RFD commits only to the data dependency.
 
 ### Question-ID constraint
 
-Because every non-coding question becomes a scenario in its modality's
-batched pipeline, and every coding question becomes a `pipeline`
-label, **question IDs must match `[a-zA-Z0-9_-]+`** — the same
-constraint RFD 0013 places on scenario codes. The Documents tab
+Because every objective (MC / MSQ / TF / SA) question becomes a
+scenario in its modality's batched pipeline and every coding question
+becomes a `pipeline` label (essays emit neither a scenario nor a
+pipeline), **client-supplied question IDs must match
+`^[a-z0-9][a-z0-9_-]{0,63}$`** (lowercase, at most 64 characters) and
+must not be a reserved name (`mc`, `msq`, `tf`, `sa`, `default`,
+`component`, `document`, `local`, `manual`, `pipeline`, `scenario`),
+enforced by `ValidateClientRef` in `resolveCreateID`; server-minted
+UUIDs bypass it. This is stricter than RFD 0013's `[a-zA-Z0-9_-]+`
+scenario-code rule, because a qid becomes a component name that
+surfaces as a bare variable in `scoring.total`. The Documents tab
 enforces this at question creation; existing v2 question IDs that
 don't conform must be renamed before v3 can grade them. The generator
 relies on this constraint for both scenario-code emission and pipeline
@@ -321,6 +346,12 @@ A default value is populated when a document is created:
 max_score = sum([for q in document.examination.questions : q.marks if q.type != "essay"])
 ```
 
+Amended: see Amendments, 2026-08-12 A. No deployed default ever
+excluded essays; the initial schema default sums every question's
+marks, since replaced by
+`max_score = sum([for _, c in component : c.max_score])` (the sum of
+every component's max).
+
 This excludes essay marks from the denominator until manual grading
 ships in a follow-up RFD — see [Open follow-ups](#open-follow-ups)
 for why this is a future breaking change.
@@ -343,7 +374,11 @@ Two modes, with one canonical storage (`scoring_policy_hcl`).
   applies) or *Weighted sum* (reveals a per-component weight table;
   generator emits `total = sum([for n, c in component : c.score *
   c.weight])` and writes `weight` onto each component, relying on RFD
-  0013's default `weight = 1`). No "Custom expression" option — custom
+  0013's default `weight = 1`). (Amended: see Amendments, B. The
+  generator has no weight input or output; the *Weighted sum* option
+  ships as inline weighted terms in the scoring body itself, written by
+  the console, not a generator-emitted `total` plus per-component
+  `weight`.) No "Custom expression" option — custom
   logic lives behind the Advanced toggle (see [Abandoned
   alternatives](#abandoned-alternatives)).
 - **Weight table** (weighted-sum only) uses human-readable labels
@@ -360,7 +395,10 @@ see [Abandoned alternatives](#abandoned-alternatives).)
 structured patterns: a match renders the editable form; a non-match
 renders the form **read-only with a banner** that still **shows the
 resolved values in plain language** (*"Pass mark: 60% of 100…"*) so a
-non-HCL instructor can sanity-check it. The exam overview carries a
+non-HCL instructor can sanity-check it. (Amended: see Amendments, C. A
+non-match falls to Advanced, the editable raw-HCL editor, with an
+informational banner; there is no read-only structured rendering.) The
+exam overview carries a
 "Scoring: custom (Advanced)" indicator so the lockout is visible before
 they open the tab. Switching Advanced → Structured warns that the
 custom expression will be lost.
@@ -383,8 +421,10 @@ the [per-modality table](#per-modality-blob-shape)).
 
 ### The fragment shape
 
-A coding question's `grading_hcl` value must contain exactly two HCL
-blocks:
+A coding question's `grading_hcl` value must contain exactly one
+`pipeline "<qid>"` block and at least one `component` knob block, plus
+an optional single top-level `locals` block. The single-knob shape
+below labels its lone `component` with the question id:
 
 ```hcl
 pipeline "<qid>" {
@@ -398,8 +438,9 @@ component "<qid>" {
 }
 ```
 
-Both blocks are required. The pipeline defines what runs; the
-component defines how its results turn into marks. The component is
+The single `pipeline` block and at least one `component` block are
+required. The pipeline defines what runs; the component knobs define
+how its results turn into marks. The component is
 included in the fragment (rather than auto-generated) because
 per-question scoring policy varies meaningfully — all-or-nothing vs
 equal partial credit vs weighted per-test-case marks vs penalty for
@@ -423,7 +464,7 @@ Because modality is immutable, the lifecycle is simple:
 |---|---|
 | Question created with `type = "coding"` | `grading_hcl` initialised with the no-op placeholder (see below). The authoring layer (document-import agent, or instructor via the "Load language template" action) replaces it with a language-correct skeleton once the language is known. |
 | Question's marking scheme edited (HCL change) | New marking-scheme version contains the new HCL. |
-| Question deleted | Marking scheme cascades through `marking_scheme_meta`'s FK to the question. |
+| Question deleted | The delete transaction explicitly removes the marking scheme (`DeleteMarkingSchemeMeta`); `marking_scheme_meta` has no FK to the question (only to `examination.document`), and the sole cascade FK runs the other way (deleting the meta row cascades the question row). |
 
 No archive column, no modality-flip handling, no soft-delete state.
 
@@ -544,20 +585,21 @@ generate(document, [per-question marking schemes], scoring_policy_hcl)
   → (pipeline_config_hcl, formula_config_hcl)
 ```
 
-It runs eagerly on every canonical-state save and its output is
-column-authoritative (timing detail in [Materialization
+It runs eagerly on every save in the materializing set and its output
+is column-authoritative (timing detail in [Materialization
 timing](#materialization-timing)). This section is what it emits.
 
 ### Per-modality emission
 
 **Coding questions.** For each coding question, the generator reads
-`grading_hcl` from the question's marking-scheme blob and splits its
-two blocks:
+`grading_hcl` from the question's marking-scheme blob and splits it into
+its single `pipeline` block and its one-or-more `component` knob blocks:
 
 - The `pipeline "<qid>" { ... }` block is appended to the assembled
   pipeline config.
-- The `component "<qid>" { ... }` block is appended to the assembled
-  formula config.
+- Each `component` knob block is appended to the assembled
+  formula config, its label namespaced to the global component name
+  `<qid>` (label equal to the qid) or `<qid>-<label>`.
 - A `pipeline "<qid>" {}` declaration block (per RFD 0013) is
   auto-emitted into the assembled formula config to ground the
   `pipeline.<qid>` namespace the component references. The instructor
@@ -580,8 +622,7 @@ pipeline "sa" {
   stage "test" {
     visibility { filter { effect = "hide"; until = "collection_stop" } }
     exec {
-      command    = "diff"
-      stdin_path = "/dev/null"
+      command = "diff"
       dynamic "scenario" {
         for_each = [for q in document.examination.questions : q if q.type == "sa"]
         labels   = [scenario.value.id]
@@ -605,6 +646,12 @@ component "sa" {
 }
 ```
 
+Amended: see Amendments, 2026-08-12 A. A modality no longer emits one
+modality-wide `component "<modality>"` summing marks; it emits a
+`dynamic "component"` expanded per question, each with
+`max_score = component.value.marks` and
+`score = try(manual[id], succeeded(pipeline.<modality>.scenarios[id].test) ? component.value.marks : 0)`.
+
 `marking.diff_flags` is the generator's translation of the SA
 `match_options` blob (mapping in [SA match options](#sa-match-options));
 `marking.expected_file` is the materialized expected-answer path (see
@@ -616,7 +663,10 @@ question id with a `test` entry (no implicit `"default"`).
 **Essay questions.** Not emitted. The default scoring-policy `max_score`
 filters them out (`if q.type != "essay"`) — see [Open
 follow-ups](#open-follow-ups) for the future-breaking-change
-implications of manual essay grading.
+implications of manual essay grading. (Amended: see Amendments,
+2026-08-12 A. Essays are emitted as a manual-only `component "<qid>"`
+(score = `try(manual[qid], 0)`, no pipeline block), and the default
+`max_score` no longer filters essays out.)
 
 ### Full assembled-config shape
 
@@ -632,7 +682,10 @@ from coding fragments). Beyond that:
   pipeline above (grounding the namespaces), the matching generated
   `component "<modality>"` blocks and authored `component "<qid>"`
   blocks, then a `scoring { ... }` wrapping `scoring_policy_hcl`
-  verbatim.
+  verbatim. (Amended: see Amendments, 2026-08-12 A. The generated
+  modality scoring unit is a per-question `dynamic "component"`, not a
+  single `component "<modality>"`; the declaration, authored-component,
+  and `scoring` parts are unchanged.)
 
 Ordering is identical across both files. Worked end-to-end examples of
 the v3 HCL live in RFD 0013's
@@ -656,11 +709,12 @@ break the instructor's intentional ordering on the Documents tab.
 ### Fragment collision handling
 
 A `qid` collision across coding questions is structurally prevented by
-`examination.question`'s primary key. If it ever surfaces, two
-`pipeline "<qid>"` blocks share a label — an RFD 0013 parse-phase
-error. The generator wraps the error with the offending question IDs
-before surfacing it, since the raw message would otherwise point at
-the assembled HCL rather than a specific editor.
+`examination.question`'s primary key. If it ever surfaced, the
+file-wide component-name uniqueness check (`declareComponent`) would
+catch it before assembly and name both offending questions. The
+generator does not wrap a pipeline-label parse error: a collision on the
+pipeline label alone would fall to the generic Internal `selfValidate`
+error carrying no question ids.
 
 ## Editorial surfaces
 
@@ -776,7 +830,7 @@ exact edits are implementation work.
 | Document, questions, modality info | Existing examination tables (unchanged) | Documents-tab content edits |
 | Marking scheme (per question) | Existing `marking_scheme_meta` + version content; `SolutionData` constrained to per-modality JSON schema | Documents-tab marking-field edits; coding-question HCL drawer save |
 | Scoring policy | New `examination.document.scoring_policy_hcl TEXT` | Grading-tab scoring UI |
-| Assembled pipeline config | `pipeline.config.source` (existing; reshaped per RFD 0013) | Generator |
+| Assembled pipeline config | `pipeline.config.config` (existing; reshaped per RFD 0013) | Generator |
 | Assembled formula config | `evaluation.formula.source` (existing; reshaped per RFD 0013) | Generator |
 | Derived expected-answer files | Examination asset paths (object storage) | Generator |
 
@@ -789,7 +843,11 @@ the marking-scheme blob — no new column on `examination.question`.
 - **On any canonical-state save:** the generator runs and writes the
   assembled config + derived assets eagerly. The save is not considered
   complete until materialization succeeds (or fails with a structured
-  diagnostic).
+  diagnostic). (Amended: see Amendments, Where the shipped semantics
+  live now (MATERIALIZATION.md). Materialization fires only on saves in
+  the materializing set (writes the compose step reads), not on any
+  canonical-state save, and it is best-effort: it records a structured
+  outcome and never blocks the save.)
 - **At grading-run start:** the runtime reads the assembled config
   columns **as-is**. No second materialization. The columns are
   authoritative.
@@ -805,7 +863,7 @@ property.
 The inline drawer lints the fragment live. The fragment holds both a
 `pipeline` block (pipeline-scope `document` contract — no `marks`) and a
 `component` block (formula-scope contract — `marks` allowed), so the
-lint endpoint (`POST /v1/documents/{id}/marking-scheme/{question_id}/lint`)
+lint endpoint (`POST /v1/documents/{document_id}/marking-schemes/{marking_scheme_id}/lint`)
 synthesizes **two shells** and runs RFD 0013's validate phase against
 each:
 
@@ -863,8 +921,10 @@ Single-record checks; no cross-record resolution required.
   succeeds; the warning surfaces in the authoring UI so the gap is
   visible before exam day.
 - For coding: `grading_hcl` is non-empty and contains exactly one
-  `pipeline "<qid>"` block and one `component "<qid>"` block where
-  `<qid>` matches the question's id, and the fragment passes the
+  `pipeline "<qid>"` block (labelled by the question id) and at least
+  one `component` block, each labelled by a distinct author knob label
+  matching `[a-zA-Z0-9_-]+` (not the qid), plus at most one `locals`
+  block, and the fragment passes the
   shell-based lint described in [Linting](#linting) (which is the
   same mechanism invoked live by the editor — save-time validation
   is not a stricter check, just the gate at save).
@@ -875,7 +935,11 @@ Single-record checks; no cross-record resolution required.
 
 Runs as part of generation, after save-time validation passes. Aborts
 the save if any check fails, leaving the canonical-state edit
-uncommitted.
+uncommitted. (Amended: see Amendments, Where the shipped semantics live
+now (MATERIALIZATION.md). Materialization is best-effort and never
+aborts the save: the canonical-state edit commits first, then
+materialize records an outcome (`applied` / `not_applied` / `partial`)
+in the document-materialization sidecar.)
 
 - Every question in the document has a marking-scheme entry.
 - Every coding question's `grading_hcl` parses cleanly when wrapped in
@@ -914,7 +978,11 @@ Items this RFD identifies but does not solve:
   - The formula currently has no `component "essay"` block. Adding one
     requires either (a) re-materializing every existing config that
     has essay questions, or (b) changing the generator's behaviour
-    going forward in a way that's not backwards-compatible.
+    going forward in a way that's not backwards-compatible. (Amended:
+    see Amendments, 2026-08-12 A. Every essay question now emits a real
+    `component "<qid>"` (score = `try(manual[qid], 0)`) from the start,
+    so this follow-up is resolved and its feared migration never
+    occurred.)
   Neither option is harmless. The manual-grading RFD must own this
   migration path explicitly; this RFD is committing to the
   current-state behaviour with the explicit awareness that it will
@@ -1062,8 +1130,8 @@ flagged in Open follow-ups as a future breaking change.
 not arrive as a separate surface; it arrived as a **per-component manual
 override**, which made essays gradable without a new denominator story.
 Every essay question emits a real component scored
-`try(manual["<qid>"], 0)` (core `internal/pipeline/configgen/emit.go:125`,
-called from `configgen/generator.go:176`), and objective and coding
+`try(manual["<qid>"], 0)` (core `internal/pipeline/configgen/emit.go:136`,
+called from `configgen/generator.go:189`), and objective and coding
 components wrap their computed score in the same guard
 (`emit.go:101`, `emit.go:177`). Essays are gradable, so they belong in
 the denominator: the initial schema default sums *every* question's
@@ -1143,12 +1211,12 @@ emit one `component "<modality>"` summing question marks, as [Per-modality
 emission](#per-modality-emission) shows. They emit a `dynamic "component"`
 expanded **per question**, keyed by question id, with
 `covers = [id]`, `max_score = marks`, and the manual-override guard
-(`emit.go:101-112`, `generator.go:208`). The pipeline stays batched; only
+(`emit.go:112-123`, `generator.go:208`). The pipeline stays batched; only
 the scoring unit became per-question. This is what makes "the sum of
 every component's max" a faithful reading of the paper. Note also that
 the modality set that section enumerates is no longer complete — an
 `msq` modality ships (core `internal/pipeline/configgen/input.go:20,71`)
-that this RFD never mentions; documenting it is out of this amendment's
+that this RFD's body did not mention when written; documenting it is out of this amendment's
 scope.
 
 #### B. The weighted-total form
