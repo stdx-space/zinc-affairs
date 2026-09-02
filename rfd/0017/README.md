@@ -10,8 +10,8 @@ labels: examination, platform, ui
 ## Overview
 
 Examination documents are trees of **contexts** (shared passages / sections) and
-**questions**, but the platform currently renders them with flat numbering
-(1, 2, 3, …) and a single global order shared by every student. This RFD
+**questions**, but before this RFD the platform rendered them with flat
+numbering (1, 2, 3, …) and a single global order shared by every student. This RFD
 introduces a coherent **layout model** that delivers four inter-related
 features:
 
@@ -39,12 +39,12 @@ Facts verified against `core` and `ui-v2` as of this writing:
 
 - **The tree already exists.** `examination.context_relation` is an adjacency
   list (`parent_description_id` must be a context; children may be contexts or
-  questions). Depth is unbounded; only self-parenting is rejected at write
+  questions). Depth was unbounded; only self-parenting was rejected at write
   time (deeper cycles are caught by a runtime `CYCLE` guard in the recursive
   ancestor query). The `ui-v2` student renderer and paginator are genuinely
-  recursive. The gaps are peripheral: context creation is root-only (nesting
-  requires a follow-up drag-drop reparent), there is no write-time cycle or
-  depth validation, and the exam sidebar collapses grouping to the top-level
+  recursive. The gaps were peripheral: context creation was root-only (nesting
+  required a follow-up drag-drop reparent), there was no write-time cycle or
+  depth validation, and the exam sidebar collapsed grouping to the top-level
   ancestor.
 - **Ordering is one global `sort_order`** (gap-1000 insertion) per document,
   shared by questions and contexts, identical for every student. It is also an
@@ -57,14 +57,14 @@ Facts verified against `core` and `ui-v2` as of this writing:
   This is the load-bearing enabler: presentation-only reordering is provably
   grading-safe as long as slugs are untouched.
 - **Numbering is deliberately client-side.** The server stores no positional
-  number (it would go stale under gap insertion); the client computes
-  `flatIndex + 1` at render time. There is no grouped-numbering concept
+  number (it would go stale under gap insertion); the client computed
+  `flatIndex + 1` at render time. There was no grouped-numbering concept
   anywhere.
 - **There is no per-student variation anywhere today.** Students read the same
   list endpoints as staff, gated by the collection-window middleware (plus
   proctoring admission where applicable). No seed, no per-user projection.
 - **Chat exists in the proctoring extension** (`proctoring.chat_message`,
-  announcements) with an opaque plain-text `body`; both UIs are bare
+  announcements) with an opaque plain-text `body`; both UIs were bare
   textareas. Question identity lives across the schema boundary in
   `examination`.
 
@@ -78,7 +78,9 @@ per-context numbering configuration:
 - The tree is capped at **3 levels** (root children = level 1). Contexts may
   appear at levels 1–2 only; level-3 nodes are questions.
 - Every node consumes a counter slot at its level — **contexts and questions
-  alike**.
+  alike**, with one exception: an only child below level 1 takes its parent's
+  label unchanged and passes its slot to its own children (level 1 never
+  collapses).
 - Level 1: `1`, `2`, `3`, …
 - Level 2: parent label + lowercase letter, no separator: `2a`, `2b`, … then
   `aa`, `ab` past `z`.
@@ -96,11 +98,13 @@ undefined numbering) is not.
 
 Numbering stays client-side, computed from the ordered tree by a shared
 frontend library used by the student app, the console preview, and the
-sidebar. The server never stores or serves a number. (Rationale: numbering is
-per-viewer once shuffling exists, and the client already owns tree assembly.
-There is currently no server-side consumer of a rendered number; if one
-appears — e.g. PDF export — the function is small enough to mirror, and this
-RFD's layout endpoint already fixes the order it would consume.)
+sidebar. The server never stores a number; it serves one only on the
+staff-only authoring summary, via a Go mirror of the client function (canonical
+order). (Rationale: numbering is per-viewer once shuffling exists, and the
+client already owns tree assembly. There was no server-side consumer of a
+rendered number when this was written; the authoring summary has since become
+one and the function was small enough to mirror, and this RFD's layout endpoint
+already fixes the order it would consume.)
 
 ### D2. Shuffle flags
 
@@ -149,10 +153,10 @@ whole order authority for the viewer, not a shuffle overlay.
   shuffle-enabled parent are permuted per student; all others are canonical.
   The standing invariant is **gating parity**: `/layout` is readable by an
   examinee exactly wherever question content is readable, no wider. Note that
-  today the server exposes *no* post-window examinee content path at all
-  (verified: every content read requires an open collection), so post-window
-  student review of one's own paper — in one's own seeded order — requires a
-  deliberate product decision to open a review read path (natural shape:
+  when this RFD was written, the server exposed *no* post-window examinee
+  content path at all (every content read required an open collection), so
+  post-window student review of one's own paper — in one's own seeded order —
+  required a deliberate product decision to open a review read path (natural shape:
   reuse the published-answer visibility/release keys, applied uniformly to
   content *and* layout, never layout alone). Deferred; see Open questions.
 
@@ -172,8 +176,8 @@ Per sibling set:
 seed = HMAC(server_key, "exam-layout-v1" || document_id || user_id || parent_id)
 ```
 
-The first 8 bytes seed a deterministic PRNG driving a Fisher–Yates shuffle of
-the canonical sibling list. No stored state: the same student sees the same
+The full 32-byte HMAC output keys a ChaCha8 PRNG driving a Fisher–Yates shuffle
+of the canonical sibling list. No stored state: the same student sees the same
 order on every reload, reconnect, and in post-exam review, forever, with no
 new table.
 
@@ -236,7 +240,8 @@ identical and canonical.
   the question in the student app. This dissolves the shuffle-ambiguity
   problem — a broadcast announcement about "question 2b" is stored as the
   slug and reads correctly in every student's private numbering.
-- Unknown or stale tokens render as literal text (v1); server-side validation
+- Malformed tokens render as literal text; unknown or stale slugs render as an
+  unresolved bare-slug chip (v1); server-side validation
   of slugs at send time is deferred (cross-schema proctoring→examination
   validation has NATS req-reply precedent when wanted).
 
@@ -325,6 +330,10 @@ mention rendering, and post-close review parity.
   unrelated to this feature), so this needs a deliberate access-surface
   decision — publishedanswer-keyed, content and layout uniformly — before the
   results view can render a re-fetched paper. Owner call.
+  Resolved after this RFD was written: the paper-review release path
+  (`CheckPaperReviewAccess`, keyed on the shared paper-release predicate) now
+  gates content and layout uniformly, so a released paper is re-fetched in the
+  student's own seeded order.
 
 ## Out of scope / future work
 
