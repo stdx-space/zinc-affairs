@@ -1,6 +1,6 @@
 ---
 authors: Thomas Li
-state: prediscussion
+state: published
 discussion:
 labels: platform, security, interop, ux
 ---
