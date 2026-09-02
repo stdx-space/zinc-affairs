@@ -1,6 +1,6 @@
 ---
 authors: Kristopher Lam
-state: prediscussion
+state: published
 discussion:
 labels: direction, infrastructure
 ---
