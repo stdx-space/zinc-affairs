@@ -13,7 +13,7 @@ integration introduced by [RFD 0012](../0012/README.md). Recordings are
 captured server-side by the LiveKit Egress service as one object per published
 track segment, stored in S3-compatible storage, indexed in a
 `proctoring.recording` ledger table, and served post-hoc to a narrow evidence
-review circle via short-lived presigned URLs.
+review circle via an authz-gated, Range-capable backend content proxy.
 
 The design deliberately targets **misconduct evidence secondary to in-person
 invigilation** — not compliance-grade archival — and optimizes for storage and
@@ -79,8 +79,8 @@ One sentence per decision; each has its own section below.
 5. **Data model** — `proctoring.recording`: an append-mostly ledger, one row
    per egress segment, keyed on `session.id` like `capture`.
 6. **Access** — chief invigilator + course-staff level only (strictly narrower
-   than live proctoring); short-TTL presigned GET after an authz check; every
-   mint is audit-logged.
+   than live proctoring); an authz-gated, Range-capable backend content proxy;
+   every access is audit-logged.
 7. **Failure stance** — gaps are derived and attributable, never paged
    per-student; OTel metrics + alerting cover systemic egress failure.
 
@@ -127,7 +127,7 @@ With track egress there is no transcode, so **recording quality is publish
 quality** — the knob lives in the student's browser at publish time, and both
 egress CPU and storage shrink proportionally with it.
 
-### Mechanics (verified against livekit-client 2.20.0)
+### Mechanics (verified against livekit-client 2.21.0)
 
 Two levers per track, both accepted by
 `setScreenShareEnabled(enabled, captureOptions, publishOptions)` /
@@ -145,8 +145,8 @@ to maintain-resolution: under pressure it drops frames instead of blurring.
 For evidence, a sharp 1 fps screen beats a smooth soft one.
 
 The client plumbing point already exists: `usePublisher`
-(`ui-v2/apps/client/app/lib/use-publisher.ts`) currently publishes with SDK
-defaults (`h1080fps15` ≈ 2.5 Mbps ≈ 2.2 GB/student for a 2 h exam). At
+(`ui-v2/apps/client/app/lib/use-publisher.ts`) published with SDK
+defaults before this RFD (`h1080fps15` ≈ 2.5 Mbps ≈ 2.2 GB/student for a 2 h exam). At
 1080p / 1–2 fps / 250 kbps the *ceiling* is ~225 MB/student (~22 GB per
 100-student exam), and realistic mostly-static exam screens land well below
 it, because a video encoder spends bits proportional to **pixel change**, not
@@ -214,7 +214,7 @@ Consequences, all acceptable:
   scrubbing UX ever matters, the fix is a post-processing remux that injects
   keyframes (the deferred Temporal hook), not a publisher change.
 - The mp4 is **not faststart** (moov atom at the tail): players must issue
-  HTTP range requests against the presigned URL — browsers and MinIO/RustFS
+  HTTP range requests against the stored object — browsers and MinIO/RustFS
   both do this natively.
 
 **1 fps vs 2 fps:** both recorded flawlessly — no stall, no keyframe
@@ -411,9 +411,12 @@ Load-bearing choices:
 - **`object_key` NOT NULL from birth** — we template the filepath in the
   StartEgress request, so the key is known before the first byte lands, and
   the sweep can check object existence for any row. The template uses numeric
-  ids only (`recordings/act{activity_id}/u{user_id}/s{session_id}/{source}-{egress_id}.mp4`)
-  because egress renders identity strings verbatim into keys — `user:999`
-  would put a `:` in the object key (S3-legal, filesystem-hostile).
+  ids only (`recordings/act{activity_id}/u{user_id}/s{session_id}/{source}-{segment_ulid}.{ext}`,
+  where `{ext}` is `mp4` for video sources and `ogg` for the microphone/screen_share_audio
+  tracks) because egress renders identity strings verbatim into keys — `user:999`
+  would put a `:` in the object key (S3-legal, filesystem-hostile). The leaf is a
+  minted ULID, not `{egress_id}`: the filepath rides in the StartEgress request
+  while the egress id only exists in its response.
 - **No gap rows.** A gap is derived at review time from segment boundaries
   joined against session events (`last_known_media_state`, WS disconnects)
   that already exist; storing gaps would denormalize a computation and invite
@@ -452,8 +455,9 @@ JWT):
 - **Names in the snapshot, numbers in the connection response.** The snapshot
   and JWT carry only preset *names* (stable contract stays small). The
   LiveKit token/connection response gains a `recording_params` block with
-  resolved `{width, height, maxFramerate, maxBitrate, contentHint}` per
-  source; the client applies whatever numbers arrive. The server owns the
+  resolved `{width, height, max_framerate, max_bitrate, content_hint}` per
+  source, keyed by `screen` and `camera` only (nil when `recording_mode=none`,
+  camera present only under `full`); the client applies whatever numbers arrive. The server owns the
   name→numbers map, so tuning a preset never needs a client release.
 - **Server-side decisions** (webhook handler, sweep) read the session's
   *effective* `policy_snapshot` — consistent with the `live_media` gate,
@@ -470,14 +474,24 @@ JWT):
 - **List:** activity-scoped endpoint with a user filter returning ledger rows;
   the review UI derives the per-student timeline (segments + attributable
   gaps) by joining against session events.
-- **Fetch:** short-TTL (~2 min) presigned GET minted after the authz check —
-  house style for plaintext artifacts (cf. pipeline `result_read`). Range
-  requests work natively against MinIO/RustFS, so video seeking is free; no
-  proxy streaming. (Spike-verified: the recorded mp4 keeps its moov atom at
-  the tail, so range support is load-bearing for browser playback.)
-- **Every mint writes a `proctoring.audit_log` row** — accessing evidence is
-  itself evidence, and this future-proofs institutional privacy-policy
-  conversations.
+- **Fetch:** `GET .../recordings/{recording_id}/content`, an authz-gated
+  backend content proxy served via `http.ServeContent` with Range support —
+  not a presigned GET, because the object store is a ClusterIP-only service (a
+  presigned `http://<store>:9000/...` URL is neither routable from a browser
+  nor allowed alongside an HTTPS page). Same shape as the pipeline
+  stdio-artifact proxy, which itself dropped presigning for an authz-gated
+  proxy (RFD 0015 Phase 7 — `GetResultArtifact` in
+  `internal/api/pipeline/run.go`, cf. `result_read`). Range requests are served
+  natively through the proxy, so video seeking is free. (Spike-verified: the
+  recorded mp4 keeps its moov atom at the tail, so range support is
+  load-bearing for browser playback.)
+- **Every access writes a `proctoring.audit_log` row before any byte is
+  served** — the row commits ahead of `http.ServeContent`, so an access that
+  cannot be audited is refused; accessing evidence is itself evidence, and this
+  future-proofs institutional privacy-policy conversations. Rows are deduped
+  server-side per `(actor, recording)` over a 30-minute window, so a scrub's
+  many range connections earn one row (a 1 h playback lands ~2 rows, not the
+  ~30 a per-request mint would have produced).
 - **Encryption stance:** recordings are plaintext objects in a dedicated
   `recordings` bucket with server-side encryption at rest. Capture-style
   envelope encryption **cannot** apply as-is — egress uploads directly to S3
