@@ -1,6 +1,6 @@
 ---
 authors: Thomas Li
-state: prediscussion
+state: committed
 discussion:
 labels: examination, platform, ui
 ---
