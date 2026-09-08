@@ -194,7 +194,9 @@ applied at read time.
 | `essay`  | `{ "marks": 10, "rubric_typst": "..."?, "reference": "..."? }` |
 | `coding` | `{ "marks": 30, "grading_hcl": "pipeline \"q1\" {...}\ncomponent \"q1\" {...}", "reference": "..."? }` |
 
-Fields marked `?` are optional.
+Fields marked `?` are optional. (Amended: see Amendments, 2026-09-08. An
+`msq` row belongs in this table; that entry gives the `msq` blob and its
+`MultiSelectInfo` answer-modality schema.)
 
 **`marks` always per-question total.** Coding questions do not carry
 per-test-case marks; differentiated per-case marks live in the authored
@@ -233,6 +235,9 @@ make scoring decisions:
 | `sa`     | `expected_file` (from `expected`); `diff_flags` (from `match_options`) | ✓ | ✓ + `marks` |
 | `essay`  | none (not auto-graded) | n/a | `marks` |
 | `coding` | `assets` (uploaded marking-scheme files, when present; the fragment is otherwise the rubric) | ✓ | ✓ + `marks` |
+
+(Amended: see Amendments, 2026-09-08. `msq` exposes `expected_file` from
+`correct_choices`, the same row as `mc`.)
 
 The generator materializes only the expected-answer bytes; the
 `expected_file` path and the `diff_flags` list are built by the snapshot
@@ -294,7 +299,9 @@ MC the `correct_choice` string, TF the boolean as the student submits
 it (`"true"`/`"false"`), SA the `expected` string verbatim. The path is
 generator/runtime-chosen and exposed via `marking.expected_file`, so
 there is no hardcoded path convention to depend on (see [Abandoned
-alternatives](#abandoned-alternatives)).
+alternatives](#abandoned-alternatives)). (Amended: see Amendments,
+2026-09-08. `msq` derives its file too: the correct set sorted, joined with
+`\n`, with no trailing newline.)
 
 These files are derived: a marking-scheme change re-materializes the
 affected files (and re-publishes the path into the document's synthetic
@@ -610,7 +617,9 @@ its single `pipeline` block and its one-or-more `component` knob blocks:
   file's top-level `locals` (see [Locals across coding
   fragments](#locals-across-coding-fragments)).
 
-**MC / TF / SA: one batched pipeline per modality.** All three emit
+**MC / TF / SA: one batched pipeline per modality.** (Amended: see
+Amendments, 2026-09-08. `msq` emits this same shape, in the same plain-`diff`
+form as MC/TF.) All three emit
 the same shape: one `pipeline "<modality>"` with a single `test` stage
 whose `dynamic "scenario"` block produces one `diff` scenario per
 question of that modality, driving the expected-answer path (and, for
@@ -678,7 +687,8 @@ from coding fragments). Beyond that:
 - **Pipeline config:** one generated `pipeline "<modality>"` per
   non-coding modality present (stable order `mc`, `tf`, `sa`), then the
   authored `pipeline "<qid>"` blocks spliced from each coding question's
-  `grading_hcl`, in question-declaration order.
+  `grading_hcl`, in question-declaration order. (Amended: see Amendments,
+  2026-09-08. The shipped order is `mc`, `msq`, `tf`, `sa`.)
 - **Formula config:** a `pipeline "<name>" {}` declaration for every
   pipeline above (grounding the namespaces), the matching generated
   `component "<modality>"` blocks and authored `component "<qid>"`
@@ -1218,8 +1228,8 @@ the scoring unit became per-question. This is what makes "the sum of
 every component's max" a faithful reading of the paper. Note also that
 the modality set that section enumerates is no longer complete: an
 `msq` modality ships (core `internal/pipeline/configgen/input.go:20,71`)
-that this RFD's body did not mention when written; documenting it is out of this amendment's
-scope.
+that this RFD's body did not mention when written; documenting it is out of
+this amendment's scope, and the 2026-09-08 amendment documents it.
 
 #### B. The weighted-total form
 
@@ -1352,3 +1362,147 @@ the coding-knob case that motivated (A).
   spellings and the recognized structured subset; core's Go port of the
   same classification is
   `internal/api/examination/authoring_summary_service.go`.
+
+### 2026-09-08: the `msq` modality (multi-select), documented
+
+The generator, the marking-scheme schema, and the examination service ship
+an `msq` ("Multiple Choice (select several)") modality this RFD's body does
+not describe. The body was written 2026-06-01 and covers five modalities:
+`mc`, `tf`, `sa`, `essay`, and `coding`. `msq` was added to core on
+2026-08-11 (commit `feat(examination): add msq multi-select answer
+modality`), after the body was frozen. The 2026-08-12 amendment (A) recorded
+that it ships but deferred documenting it. The 2026-09-03 corrections added
+`msq` to the reserved-name list and the objective-question enumeration
+([Question-ID constraint](#question-id-constraint)) without describing the
+modality. This entry describes it. Where it and the body's per-modality
+tables disagree by omission, this entry governs.
+
+`msq` is multiple choice where the student selects a set of choices. Grading
+is all-or-nothing: the submitted set must equal the authored correct set.
+`msq` is an objective modality, so it earns an auto verdict and batches with
+`mc`, `tf`, and `sa` (core `internal/pipeline/evaluate.go:597`,
+`configgen/input.go:71`), and it has no manual-grading surface of its own.
+
+#### A. Blob shape and answer-modality schema
+
+The table in [Per-modality blob shape](#per-modality-blob-shape) has no
+`msq` row. The shipped blob is `MarkingSchemeMSQ` (core
+`internal/api/examination/marking_scheme_types.go:49-52`):
+
+| Modality | Blob shape |
+|---|---|
+| `msq` | `{ "marks": 5, "correct_choices": ["A", "C"] }`; each key must be a key of the question's `MultiSelectInfo.choices`. |
+
+`correct_choices` is required and must be non-empty
+(`validate:"required,min=1"`), including when the question's
+`min_selections` is 0. A blank answer is never uploaded, because the exam
+client omits empty answers, so an empty correct set produces no file for
+`diff` to read and can never be scored correct. An author who wants "none of
+these" adds a real choice for it (`marking_scheme_types.go:44-48`).
+
+`msq` also carries an answer-modality `extra_info` schema the body does not
+list, `MultiSelectInfo` (core `internal/api/examination/types.go:273-297`):
+
+- `choices` is the label-to-text map, as for `mc`, but its keys are
+  constrained to `^[A-Za-z0-9_-]{1,32}$` (`msqChoiceKeyPattern`,
+  `answer_modality_service.go:679`). The constraint applies to `msq` alone;
+  `mc` keys are unconstrained. It is what makes the serialization in (B)
+  safe.
+- `max_selections` is required (`gte=1`). A question with no cap is a
+  pick-any-subset question, which under all-or-nothing grading is rarely the
+  author's intent, and the exam client needs the cap to stop a student
+  selecting every choice.
+- `min_selections` is optional. An omitted value means 0, the permissive
+  floor: a bare integer cannot distinguish an omitted field from an explicit
+  0. Authoring surfaces should still ask for it rather than let it default
+  silently.
+
+#### B. Expected file: the two-language serialization
+
+[Derived assets](#derived-assets) lists `mc`, `tf`, and `sa`, but not `msq`.
+For `msq` the generator materializes the correct set in a canonical
+encoding: the keys sorted ascending, joined with `\n`, with no trailing
+newline (`SerializeMSQAnswer`, core `configgen/expected_files.go:22`).
+Grading is a byte `diff` of this file against the student's uploaded answer.
+
+The encoding is a two-language contract. The exam client writes the
+student's answer file with the same rule in TypeScript, and any divergence
+mis-grades. Two properties keep it safe, and both rely on the key-charset
+constraint in (A). The trailing newline is omitted because `diff` reports a
+trailing-newline mismatch as a difference. Over `[A-Za-z0-9_-]`, Go's byte
+ordering and JavaScript's UTF-16 code-unit ordering are identical, so the
+two sorts cannot diverge for any legal key set. The TypeScript half belongs
+to the exam client; this RFD commits only to the Go serialization and the
+shared rule.
+
+Exposure matches `mc` ([Exposure through
+`document.examination`](#exposure-through-documentexamination)):
+
+| Modality | `marking.<...>` exposed | Pipeline | Formula |
+|---|---|---|---|
+| `msq` | `expected_file` (from `correct_choices`) | ✓ | ✓ + `marks` |
+
+The published answer key carries `msq` as `AnswerKeyMSQ { correct_choices }`
+(`answer_key.go:48`).
+
+#### C. Emission
+
+`msq` emits with the batched objective modalities, in the same shape as `mc`
+and `tf`: one `pipeline "msq"` whose `dynamic "scenario"` runs one plain
+`diff` per `msq` question against `marking.expected_file`, and a per-question
+`dynamic "component"` (the shape in [Per-modality
+emission](#per-modality-emission), as amended 2026-08-12 A). `msq` takes no
+`diff_flags`; that concatenation is specific to `sa` (`configgen/emit.go:38`).
+
+The shipped code contradicts one order the body states. [Full
+assembled-config shape](#full-assembled-config-shape) gives the stable
+non-coding pipeline order as `mc`, `tf`, `sa`. The shipped order is `mc`,
+`msq`, `tf`, `sa`: `msq` sits next to `mc` as the same question shape with a
+set-valued answer (`nonCodingBatchOrder`, `configgen/input.go:71`). Emission
+is gated on `present[modality]`, so a document with no `msq` questions
+produces byte-identical output whatever `msq`'s place in the list
+(`input.go:68-70`). Only documents that contain `msq` questions are affected.
+
+#### D. Validation
+
+`msq` is validated across the same gates the body describes for the other
+modalities, split across the two separately versioned resources:
+
+- Write-time, on the modality `extra_info` (`validateMultiSelectInfo`,
+  `answer_modality_service.go:693`): every choice key matches the charset,
+  `min_selections` is not greater than `max_selections`, and
+  `max_selections` is not greater than the number of choices. An
+  unsatisfiable question cannot be saved, so it does not surface later as a
+  student-side lockout.
+- Save-time, on the marking-scheme blob (`ValidateMarkingSchemeData`,
+  `marking_scheme_types.go:213-260`): every `correct_choices` key is one of
+  the question's choices, the set has no duplicates, and its size falls
+  within `[min_selections, max_selections]`. The correct set must be one a
+  student could submit. This cross-check lives here, not in the modality
+  validator, because the modality may be saved before its marking scheme.
+- Publish-time (`publish_service.go:75,86`): rechecks the authored set
+  against the modality, so a `correct_choices` set left outside its
+  selection bounds is caught at publish. The modality-edit-after-scheme path
+  (`marking_scheme_service.go:649`) invalidates a scheme whose set the new
+  choice map or bounds no longer admit.
+- Materialization-time: an unauthored or empty-set scheme is an
+  authoring-class generator diagnostic, worded "Multiple Choice (select
+  several) marking scheme does not say which choices are correct"
+  (`configgen/expected_files.go:62`). Core
+  `internal/api/examination/MATERIALIZATION.md:393` records the empty-set
+  case.
+
+#### E. Deferred, as with SA `accept`
+
+Grading is all-or-nothing, and partial credit is not modelled. Partial
+credit can be added later as optional blob fields with no migration:
+`decodeStrict` rejects a newer blob only on an older server, and a newer
+server reads an older blob unchanged (`marking_scheme_types.go:38-42`). This
+is the `msq` counterpart of the deferred `sa` multi-answer comparator: the
+schema has room for it, and v1 does not implement it.
+
+The examination-import flow ([Examination-import
+integration](#examination-import-integration)) predates `msq` and has no
+`msq`-specific handling; its manifest path does not branch on modality.
+Import coverage of `msq` is unspecified here and left to that flow's own
+follow-up. `msq` questions are authored on the Documents tab.
