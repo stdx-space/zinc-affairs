@@ -757,7 +757,19 @@ its own visual design round with running candidates before any choice.
 
 Exam and assignment as stored templates (contract-neutral, because create
 takes an inline envelope); the online-homework checklist; a readiness gate on
-activation; the console presentation of the two mixed axis combinations.
+activation; the console presentation of the two mixed axis combinations;
+extensions advertising their settings schema to the core.
+
+Extensions advertising their settings schema, so that the core holds no
+per-key file, is out of scope. Rule 3 makes a write's legality a function of
+the envelope alone, so an advertised schema would have to be persisted by the
+core to validate a write while its extension is down; that is a schema
+registry with a versioning and migration story of its own. The cross-key
+predicates of rule 2 are declared by a dependent key about another key and
+cannot be advertised by either key alone, so they stay in the core in any
+design. Nothing in the envelope, the notification, or the readiness subject
+forecloses the change: the shared package's specification table is populated
+through one registration path that a runtime source could feed later.
 
 ## Implementation
 
