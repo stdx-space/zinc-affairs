@@ -262,11 +262,18 @@ unchanged:
   them, and the envelope holds the switch and the activity-level policy,
   never the artefact's parameters. The test for a value: does it describe
   how to build or run a resource the extension provisions, or does it state
-  a rule the activity imposes on students or on other extensions? The
+  a rule the activity imposes on students or on other extensions? A rule
+  that another extension derives, or that needs data outside the envelope
+  to validate, stays in the owning extension's schema even when it is a
+  rule the activity imposes on students, because the deriving extension has
+  no settings write and a key's validator sees only the envelope. The
   sandbox limits are the pool's parameters and stay with sandbox; the
   proctoring policy is the set of rules students meet at admission and is
   policy; the pipeline trigger is a rule about when grading runs and is
-  policy. Artefact editors live with their extension, as the console
+  policy; the submission parts are a rule imposed on students that meets
+  both exceptions and stay with submission, as the submission parts
+  paragraph after the table sets out.
+  Artefact editors live with their extension, as the console
   already edits templates on the environment page; the settings rail holds
   switches and policy.
 - **An authoring fact stays with the artefact it describes** and versions
@@ -286,7 +293,7 @@ What moves into the envelope, and what stays:
 
 | Extension | Moves into `settings` | Stays in the extension |
 |---|---|---|
-| submission | `cutoff` (from `core.activity.kind`) | collections and their windows, limits, release timestamps |
+| submission | `cutoff` (from `core.activity.kind`) | collections and their windows, limits, release timestamps; the submission parts, a staff set and a derived set |
 | examination | `enabled` | the document and all authoring facts |
 | pipeline | `enabled`, `trigger_run_on_submit` (from the config attachment row) | the config attachment (the binding) |
 | report | `enabled`, `score_selection` (which the of-record seam reads), `default_score_visibility` (applied to new collections) | per-collection release state; the reserved per-collection `score_selection` column becomes dead and is dropped |
@@ -297,6 +304,25 @@ What moves into the envelope, and what stays:
 `score_selection` sits under `report` because its readers are the gradebook,
 the student score read, the roster flag, and export eligibility, all report
 paths; the grading snapshot in pipeline is the one other reader.
+
+**Submission parts stay in submission's schema.** The parts are the
+per-activity declaration of what a student hands in, specified by the
+submission parts design in core, and live in a submission-owned table as
+two rows: a staff set, authored for uploads, and a derived set that
+examination's materialization writes from the paper (RFD 0014). They are a
+rule the activity imposes on students, and they meet both exceptions of the
+artefact test above: examination derives one set, and validating a part's
+limits needs the instance upload caps. Three properties of the envelope are
+what make those exceptions necessary. Only the core writes the core
+schema, so materialization, which is not a core route, has no way to write
+the derived set into a key. A key's validator sees the new value and the
+resolved envelope and nothing outside them, so it can neither compare a
+part's limits with the instance upload caps, which are deployment
+configuration, nor refuse a staff edit to a field that materialization
+manages. The per-key replace is a full replace under one revision token. A
+staff replace would overwrite a field materialization had written, and a
+materialization write would move the token, so a staff write that carries
+`If-Match` would then fail its precondition.
 
 ### Typed in Go, one package, one file per key
 
@@ -638,19 +664,26 @@ provides.
 ## The modality rule and online homework
 
 The two modalities are exclusive by rule: with the paper on, the console's
-file-upload surface is off and prescreen rules are shown as not applicable;
-with it off, the exam client is not offered. The console's document-presence
-gates read the examination switch instead. The rule lives on the console
-surface, and two server behaviours are recorded as known gaps: the exam
-client pushes answers as per-question text attachments through the same
-attachments route the console upload uses, and the push applies the
-collection's prescreen ignore filters with no modality check, so an ignore
-filter matching text files on a paper collection drops answers silently; and
-export eligibility keys on the type before this RFD and on the paper axis
-and "every collection past its stop", which makes a soft-cutoff paper
-activity exportable once its windows end. Server-side enforcement, if ever
-wanted, is a marker on the client's negotiated push and a refusal of
-unmarked uploads on paper activities.
+file-upload surface is off; with it off, the exam client is not offered. The
+console's document-presence gates read the examination switch instead. The
+rule lives on the console surface, and two server behaviours are recorded as
+known gaps: the exam client pushes answers as per-question text attachments
+through the same attachments route the console upload uses, and the push
+has no modality check; and export eligibility keys on the type before this
+RFD and on the paper axis and "every collection past its stop", which makes
+a soft-cutoff paper activity exportable once its windows end. Server-side
+enforcement, if ever wanted, is a marker on the client's negotiated push and
+a refusal of unmarked uploads on paper activities.
+
+The examination switch also selects which part set submission enforces,
+under the submission parts design in core: the derived set that
+materialization writes from the paper (RFD 0014) while the switch is on, and
+the staff set while it is off. Both sets persist and the switch only selects
+between them, so a flip loses neither and turning the switch back restores
+the set that was in force. When the selected set is absent, because the
+paper has not been materialized with parts or the upload activity has no
+staff set, the activity has no parts and submission accepts any file within
+the instance caps.
 
 Nothing in the core prevents a soft cutoff with a paper. The gaps are in
 the clients and in semantics: the exam client's entry gate compares the
