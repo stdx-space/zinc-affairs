@@ -301,7 +301,10 @@ generator/runtime-chosen and exposed via `marking.expected_file`, so
 there is no hardcoded path convention to depend on (see [Abandoned
 alternatives](#abandoned-alternatives)). (Amended: see Amendments,
 2026-09-08. `msq` derives its file too: the correct set sorted, joined with
-`\n`, with no trailing newline.)
+`\n`, with no trailing newline.) (Amended: see Amendments, 2026-10-08.
+Materialization derives a fourth artifact beside the expected files: the
+activity's derived submission parts, one part per question, written to
+the submission extension.)
 
 These files are derived: a marking-scheme change re-materializes the
 affected files (and re-publishes the path into the document's synthetic
@@ -596,6 +599,10 @@ generate(document, [per-question marking schemes], scoring_policy_hcl)
 It runs eagerly on every save in the materializing set and its output
 is column-authoritative (timing detail in [Materialization
 timing](#materialization-timing)). This section is what it emits.
+(Amended: see Amendments, 2026-10-08. Derived submission parts are not
+generator output: a separate leg of materialization derives them from the
+question roster before the generator runs, so an authoring failure that
+withholds the config does not withhold the parts.)
 
 ### Per-modality emission
 
@@ -848,6 +855,9 @@ exact edits are implementation work.
 Rows 1-3 are canonical; rows 4-6 are derived. Mutating a derived row
 directly (outside the generator) is unsupported. Coding HCL lives in
 the marking-scheme blob, with no new column on `examination.question`.
+(Amended: see Amendments, 2026-10-08. A seventh row is derived: the
+activity's derived submission parts, in a submission-owned table, written
+by the parts leg of materialization rather than by the generator.)
 
 ### Materialization timing
 
@@ -858,7 +868,9 @@ the marking-scheme blob, with no new column on `examination.question`.
   live now (MATERIALIZATION.md). Materialization fires only on saves in
   the materializing set (writes the compose step reads), not on any
   canonical-state save, and it is best-effort: it records a structured
-  outcome and never blocks the save.)
+  outcome and never blocks the save.) (Amended: see Amendments,
+  2026-10-08. The same saves also run the parts leg, which records its own
+  outcome and does not wait for the generator.)
 - **At grading-run start:** the runtime reads the assembled config
   columns **as-is**. No second materialization. The columns are
   authoritative.
@@ -1506,3 +1518,145 @@ integration](#examination-import-integration)) predates `msq` and has no
 `msq`-specific handling; its manifest path does not branch on modality.
 Import coverage of `msq` is unspecified here and left to that flow's own
 follow-up. `msq` questions are authored on the Documents tab.
+
+### 2026-10-08: derived submission parts, a fourth materialization artifact
+
+This entry extends the design ahead of its implementation rather than
+recording a divergence: it is agreed design, and nothing it describes is
+built. Where it and the body disagree, this entry governs.
+
+A **part** is a named group of files a student hands in, with acceptance
+rules: glob patterns over stored names, an extension allowlist,
+`min_files`, `max_files`, and a byte budget. The submission extension
+owns parts and enforces them at finalize and force-submit without knowing
+what a question is. Staff author parts for an upload activity; for an
+examination activity the paper derives them. Submission keeps two part
+rows per activity, a staff row and a derived row, and the activity's
+answering-mode switch (RFD 0018) selects the enforced one: the derived
+row while examination is on, the staff row otherwise. An absent row means
+legacy behaviour, any file under the instance caps. The part model, the
+enforcement rules, and the routes are the submission design's; this entry
+covers what examination derives, how it is written, and when.
+
+#### A. The artifact and its owner-side write
+
+Materialization derives a fourth artifact from the document, beside the
+pipeline config, the scoring formula, and the expected-answer files (core
+`internal/api/examination/MATERIALIZATION.md`): the activity's derived
+part set, one part per question. It is written through an owner-side
+request to the submission extension,
+`submission.requests.upsert_derived_parts`, in the same shape as
+`pipeline.requests.upsert_derived_config` and
+`report.requests.upsert_derived_formula`: idempotent per activity,
+carrying `actor_user_id` (the saver, or `0` for system work), and
+answering a refusal with a typed `denied` reply rather than a transport
+error. Submission upserts its derived row and marks it
+`managed_by_document`; the derived row has no other write path, and staff
+cannot edit it while the document manages it, as with a derived config or
+formula row.
+
+Why a request to the owner: parts are enforcement state that submission
+reads at finalize, and cross-schema writes go through their owners.
+Examination writes no submission table. Submission authorizes the write
+against `activity#can_edit` for the carried actor, as the pipeline
+owner's first-create rule does; actor `0` is system work from the retry
+workflow.
+
+#### B. Derived patterns
+
+One part per question, named by the question id, with patterns that match
+the file the exam client writes (`answerFilename` in the exam client's
+`apps/client/app/lib/exam.ts`):
+
+| Modality | Pattern | `min_files` | `max_files` |
+|---|---|---|---|
+| `mc`, `msq`, `tf`, `sa`, `essay` | `<qid>.txt` | 0 | 1 |
+| `coding` | `<qid>.*` | 0 | 1 |
+
+Three choices carry a reason.
+
+- An essay question gets a part although the generator emits nothing for
+  it ([Per-modality emission](#per-modality-emission)). The part declares
+  what is handed in, not what is graded, and the exam client writes
+  `<qid>.txt` for every non-coding question.
+- `<qid>.*` is unambiguous across questions because the [Question-ID
+  constraint](#question-id-constraint) forbids `.` in a question id, so
+  the id is the stem of one answer file and the extension follows the
+  question's language. The exam client removes the previous answer file
+  when a coding question's language changes, so a stale `q3.py` beside
+  `q3.java` cannot exceed `max_files`. A future multi-file coding question
+  can use `<qid>/**`.
+- `min_files = 0` on every part: an unanswered question is a legitimate
+  blank, so parts never block finalize. They reject unexpected and
+  malformed files; they do not require an answer. Otherwise a student who
+  skipped one question could not submit at all.
+
+#### C. The parts leg runs first and independently of the generator
+
+Parts depend only on each question's id and modality kind. The generator
+is document-global and all-or-nothing: one unauthored marking scheme
+records `not_applied` and withholds every derived artifact. That is the
+right failure for a config, because a partial config would mis-score. It
+is the wrong failure for parts: an unfinished question elsewhere in the
+paper must never leave the enforced parts behind the paper, or a finished
+question's answer file would be rejected at finalize as unmatched. The
+parts leg is therefore separate from the generator and its fan-out in
+three ways.
+
+- **Placement.** The leg runs in `materialize()` before compose and the
+  generator, and does not depend on either: it runs even when compose
+  fails. `persistMaterialization` runs only after `Generate` succeeds, so
+  the leg cannot live in the existing fan-out.
+- **Its own read.** `composeGeneratorInput` aborts on the first
+  per-question failure, so a later question's kind would never be
+  resolved through it. The leg reads the roster and each question's kind
+  directly, through `retrieveModality`, and reads nothing else. A
+  question's kind lives in its modality record in object storage, so a
+  per-question read can fail; the leg derives parts for every readable
+  question, skips an unreadable one, and records a diagnostic naming it.
+- **Its own outcome.** The outcome record gains `parts_state`, set
+  independently of `state`: `applied` when every question's part was
+  written, `partial` when some questions were skipped, with the
+  diagnostics naming them, and `not_applied` when nothing was written.
+  Parts applied with the config `not_applied` on an authoring failure is
+  the ordinary state of a paper being authored, and the record represents
+  it. The ordering-guard self-heal (`outcomeStompedNewerRecord`) covers
+  `parts_state` as it covers `state`: an older attempt that wrote stale
+  parts after a newer attempt recorded fires the retry workflow, so the
+  stores and the record converge instead of leaving stale parts enforced.
+
+Failures of the leg are classed as the config and formula legs' are. A
+typed denial is an authoring failure: it is not retried, and the fix is a
+save by someone who holds the right. A transport or storage failure is an
+infrastructure failure, retried through the retry workflow
+`workflow/materializeretry`, which re-runs as the last saver.
+
+#### D. Triggers and the input hash
+
+No new trigger and no new input-hash component. The leg's whole input,
+the ordered (question id, kind) list, is already part of the ordered
+question list the input hash covers, and it already changes on every
+route in the materializing set that can change it (question create,
+delete, publish, and reorder). The
+materializing set is unchanged, and the manual endpoint
+`POST /documents/{document_id}/materialize` re-derives parts with
+everything else.
+
+The derived pipeline config needs no change either. The batched modality
+pipelines read `<qid>.txt` at the workspace root, which is where a matched
+file is staged, and a coding fragment's `pipeline "<qid>"` refers to the
+part named after its label by default (the `submission` block of [RFD
+0013](../0013/README.md)), so existing fragments keep working. How matched
+files reach a run's workspace is the agent placement in RFD 0015.
+
+#### E. Rollout
+
+Existing examination documents gain derived parts lazily, on their next
+materializing save or a manual materialize. There is no cross-document
+sweep, so a deploy never tightens a running exam mid-window: until a
+document re-materializes, its activity has no derived row and submission
+applies legacy behaviour. A materializing save during a window does write
+parts, which then apply at the next finalize; that is a staff action,
+taken while staff are watching. The exam client's refetch-and-retry on a
+finalize rejected as unmatched lands before this leg, so a paper edited
+during a window does not strand a client holding the old paper.
