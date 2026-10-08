@@ -1041,3 +1041,150 @@ Listed explicitly to mark the boundary for follow-up RFDs:
 - **Cross-file `import` / `include`.** A pipeline config and a formula config are each one self-contained HCL file. Sharing fragments across configs is not supported in v3.
 - **Stdout/stderr size caps and per-stage output limits.** The runtime imposes its own caps; per-stage configurable output limits are a runtime RFD's concern.
 - **UI changes for the new HCL editor.** The `apps/console` editor consumes a schema produced by reflecting on the v3 Go structs (`schemagen`); the schema is updated as part of v3 implementation. The visual design of the editor is a separate UI track.
+
+## Amendments
+
+Amendments record changes to the design above after this RFD merged. The
+body is left as written, as the design record. Where an amendment and the
+body disagree, the amendment is authoritative.
+
+### 2026-10-08: Pipelines place submission parts
+
+State: proposed. Discussion: the pull request link is added when the pull
+request opens.
+
+Affects [Pipeline block](#pipeline-block) (a `submission` block the body
+omits) and [Validate phase](#validate-phase-schema-only) (the rules for
+that block).
+
+#### Problem
+
+Core's pipeline parser accepts a `submission` block the body does not
+document (`internal/pipeline/spec_pipeline.go`, `internal/pipeline/parse.go`):
+
+```hcl
+pipeline "q3" {
+  submission {
+    file = "src/main/java/app/Solution.java"   # required
+  }
+}
+```
+
+A **delivery** is the set of files a student hands in for an activity.
+Every pipeline run mirrors the whole delivery into its workspace root
+(`workflow/grading/staging.go`). The block names the workspace path of
+one file from that delivery, the **answer**: the root file whose name
+minus its extension equals the pipeline label, so `q3.py` for the
+pipeline `"q3"`. The agent places the answer after the teacher's objects,
+and the answer wins its target, so a skeleton stub at the same path is
+replaced (`AnswerSpec` in `internal/pipeline/agentcontract/contract.go`).
+The exam client writes `<qid>.<ext>` for a coding question and the
+question id is the pipeline label, so the rule holds without
+configuration. Without the block the answer keeps its delivered name at
+the root.
+
+The rule has two limits. It places at most one file, chosen by stem, so a
+pipeline cannot receive several delivered files at a chosen location
+and cannot choose among several delivered files by name. And the mirror puts
+every delivered file into every run, including files no rule accepts.
+
+The submission extension gains **parts**: named groups of delivered files
+with acceptance rules, matched by globs over the stored file names. Staff
+author parts for an upload activity; examination derives them from the
+paper, one part per question named by the question id, as a
+materialization artifact (RFD 0014). A delivery that passes its parts is
+stamped with the mapping from part to files, and grading reads that stamp
+rather than matching again (the submission parts design in core). With a
+declared mapping, a pipeline can address files by part, and staging can
+place by part instead of mirroring the whole delivery.
+
+#### Change
+
+The block gains `part` and `dir`:
+
+```hcl
+pipeline "q3" {
+  submission {
+    file = "src/main/java/app/Solution.java"   # part omitted: part "q3"
+  }
+}
+
+pipeline "report" {
+  submission {
+    part = "code"            # patterns = ["code/**"]; the base is "code/"
+    dir  = "src/main/app"    # code/Main.py lands at src/main/app/Main.py
+  }
+}
+```
+
+- `part` names the part the block places. When omitted, the block refers
+  to the part named after the pipeline label. This carries the stem rule
+  over to parts, because the answer stem, the label, and the question id
+  are the same name, so a config written for the answer rule keeps
+  working once its activity has parts. A hand-written config for an
+  upload activity names `part`.
+- `file` places a single-file part at the given workspace path, which may
+  rename the file. Placing it over a skeleton stub is allowed, because the
+  student placement wins. Lint requires the part's `max_files = 1`.
+- `dir` mounts a multi-file part under the given directory after
+  stripping the part's **base**: the literal prefix shared by all of its
+  patterns, which must end at a path-segment boundary. The pattern
+  `q8/**` has the base `q8/`; a part with the patterns `q8/**` and
+  `q8b/**` has no base and cannot be mounted with `dir`.
+- A block carries exactly one of `file` or `dir`, so it always names a
+  path. Both take a workspace-relative path: clean, with no `..` segment,
+  and outside the reserved workspace directories.
+
+The shape of the block is a validate-phase check. The checks that need
+the part set (the part exists, `max_files = 1` for `file`, a base for
+`dir`) run when the config is saved for an activity, against that
+activity's enforced part set, so they sit outside the single-file validate
+phase.
+
+**Staging.** Every pipeline run of a delivery with a stamped mapping
+receives all of the matched files at their stored paths, and a file no
+part matched is never staged. A part that a `submission` block places
+exists only at its target: `file` and `dir` replace that part's default
+placement, so the part is not also at its stored path. Such a run does
+not apply the answer rule; there is no delivery mirror to find a root
+file in, and part placement takes its place. Batched modality pipelines,
+which read `<qid>.txt` at the workspace root, need no change. A delivery
+of an activity with no parts keeps the whole-delivery mirror and the
+answer rule, so a `submission { file }` block without `part` keeps its
+meaning there.
+
+**Dangling references.** A `part` name, explicit or defaulted from the
+label, that the activity's enforced part set does not contain is caught
+three ways: pipeline lint checks the names against the enforced set when
+the config is saved; the console's activity setup checklist lists them;
+and at run time staging fails the run as an infrastructure error before
+any stage runs, so a workspace that received no files is never graded as
+0. On an activity with no parts, a block that sets `part` or `dir` is a
+dangling reference and fails the lint; only a plain `file` has a meaning
+there.
+
+**Agent protocol.** Placement by part uses agent protocol version 4,
+which adds a student placement, from a stored file to a target path, that
+wins over teacher files as the answer placement does (the agent protocol
+amendment of RFD 0015). A run of a delivery with a stamped mapping
+requires version 4. The agent is baked into the environment image; an
+image whose agent predates version 4 fails the run with the "rebuild the
+environment image" failure that a protocol mismatch raises. Runs of
+deliveries without parts keep the protocol version they use without this
+amendment.
+
+#### Alternatives considered
+
+- **Explicit file and directory part kinds.** A part declared as a file
+  or as a directory would make `file` and `dir` checkable from the kind
+  alone. Globs cover both shapes with one matcher, and the base rule
+  gives `dir` an equivalent check: a multi-file part has a mount point if
+  and only if its patterns share a segment-aligned prefix.
+- **A server readiness responder for dangling references.** It relied on
+  a per-extension readiness route that core does not have. Core has the
+  extension-health read and the console setup checklist, and the lint and
+  the run-time failure cover the rest.
+- **Keep the whole-delivery mirror for runs with parts.** Every delivered
+  file would reach every run, including files the parts rejected and
+  files staff committed as unmatched. Staging only the matched files
+  keeps the workspace equal to the stamped record.
